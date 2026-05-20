@@ -1,0 +1,2822 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Portfolio Cockpit v2.6</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" />
+<style>
+  body { background: #020617; color: #fff; font-family: ui-sans-serif, system-ui, -apple-system; }
+  .animate-fade-in { animation: fadeIn 0.2s ease-out; }
+  .animate-expand { animation: expand 0.25s ease-out; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px);} to { opacity:1; transform: translateY(0);} }
+  @keyframes expand { from { opacity:0; max-height:0;} to { opacity:1; max-height:500px;} }
+  .pulse-dot { animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100% { opacity:1;} 50% { opacity:0.4;} }
+  .sticky-th th { position: sticky; top: 0; z-index: 10; background: #1e293b; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useMemo, useCallback, useRef } = React;
+
+/* ============================================================
+   CONSTANTES / VERSIÓN
+   ============================================================ */
+const STORAGE_KEY = 'portfolio_cockpit_v2';
+const SNAPSHOTS_KEY = 'portfolio_snapshots_v2';
+const FUNDAMENTALS_KEY = 'portfolio_fundamentals_v2';
+const FINNHUB_KEY_STORE = 'finnhub_api_key';
+const CLAUDE_KEY_STORE = 'claude_api_key';
+const LAST_BACKUP_STORE = 'last_backup_date';
+const APP_VERSION = '2.6';
+
+const DEFAULT_DATA = {
+  version: APP_VERSION,
+  holdings: [],
+  sales: [],
+  dividends: [],
+  trms: { USD: 4000, EUR: 4300 },
+  targetAllocation: {},
+  categoryMap: {}
+};
+
+/* ============================================================
+   HELPERS
+   ============================================================ */
+const fmt = (n, dec = 2) => {
+  if (n === null || n === undefined || isNaN(n)) return '—';
+  return Number(n).toLocaleString('es-CO', { minimumFractionDigits: dec, maximumFractionDigits: dec });
+};
+const fmtPct = (n) => {
+  if (isNaN(n)) return '—';
+  if (typeof window !== 'undefined' && window.__privacy_hidden) return '••%';
+  return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
+};
+const fmtMoney = (n, c = 'USD') => {
+  const sym = c === 'USD' ? '$' : c === 'EUR' ? '€' : '';
+  const suffix = c === 'COP' ? ' COP' : '';
+  if (typeof window !== 'undefined' && window.__privacy_hidden) {
+    return `${sym}•••${suffix}`;
+  }
+  return `${sym}${fmt(n)}${suffix}`;
+};
+
+const convert = (amount, from, to, trms) => {
+  if (from === to) return amount;
+  let cop;
+  if (from === 'COP') cop = amount;
+  else if (from === 'USD') cop = amount * trms.USD;
+  else if (from === 'EUR') cop = amount * trms.EUR;
+  else cop = amount;
+  if (to === 'COP') return cop;
+  if (to === 'USD') return cop / trms.USD;
+  if (to === 'EUR') return cop / trms.EUR;
+  return amount;
+};
+
+const snapshotMultiCurrency = (amount, nativeCurrency, trms) => ({
+  USD: convert(amount, nativeCurrency, 'USD', trms),
+  EUR: convert(amount, nativeCurrency, 'EUR', trms),
+  COP: convert(amount, nativeCurrency, 'COP', trms)
+});
+
+/* CAGR: (end/start)^(1/años) - 1 */
+const calcCAGR = (startValue, endValue, days) => {
+  if (!startValue || startValue <= 0 || !endValue || days <= 0) return null;
+  const years = days / 365.25;
+  if (years < 0.08) return null; /* <30 días no es significativo */
+  return (Math.pow(endValue / startValue, 1 / years) - 1) * 100;
+};
+
+const daysBetween = (a, b) => {
+  const ms = new Date(b).getTime() - new Date(a).getTime();
+  return Math.max(0, Math.floor(ms / 86400000));
+};
+
+/* XIRR via Newton-Raphson — para MWR */
+const xirr = (cashflows /* [{date, amount}] */, guess = 0.1) => {
+  if (cashflows.length < 2) return null;
+  const t0 = new Date(cashflows[0].date).getTime();
+  const years = cashflows.map(cf => (new Date(cf.date).getTime() - t0) / (365.25 * 86400000));
+  const npv = (r) => cashflows.reduce((s, cf, i) => s + cf.amount / Math.pow(1 + r, years[i]), 0);
+  const dnpv = (r) => cashflows.reduce((s, cf, i) => s - years[i] * cf.amount / Math.pow(1 + r, years[i] + 1), 0);
+
+  let r = guess;
+  for (let i = 0; i < 100; i++) {
+    const v = npv(r), d = dnpv(r);
+    if (Math.abs(d) < 1e-12) break;
+    const next = r - v / d;
+    if (Math.abs(next - r) < 1e-8) return next * 100;
+    if (!isFinite(next) || next < -0.99) return null;
+    r = next;
+  }
+  return null;
+};
+
+/* ============================================================
+   TOAST
+   ============================================================ */
+const ToastContext = React.createContext({ showToast: () => {} });
+
+/* PRIVACY CONTEXT: oculta valores monetarios con *** */
+const PrivacyContext = React.createContext({ hidden: false, toggleHidden: () => {} });
+const usePrivacy = () => React.useContext(PrivacyContext);
+const maskValue = (s, hidden) => hidden ? s.replace(/[\d.,]+/g, '•••') : s;
+const ToastProvider = ({ children }) => {
+  const [toasts, setToasts] = useState([]);
+  const showToast = useCallback((msg, type = 'info') => {
+    const id = Date.now() + Math.random();
+    setToasts(t => [...t, { id, msg, type }]);
+    setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 3500);
+  }, []);
+  return (
+    <ToastContext.Provider value={{ showToast }}>
+      {children}
+      <div className="fixed top-4 right-4 z-[100] space-y-2">
+        {toasts.map(t => (
+          <div key={t.id} className={`px-4 py-2 rounded-lg shadow-xl animate-fade-in text-sm font-medium ${
+            t.type === 'error' ? 'bg-red-600' : t.type === 'success' ? 'bg-green-600' : 'bg-slate-700'
+          }`}>{t.msg}</div>
+        ))}
+      </div>
+    </ToastContext.Provider>
+  );
+};
+const useToast = () => React.useContext(ToastContext);
+
+/* ============================================================
+   PERSISTENCIA + MIGRACIÓN v2.1 → v2.2
+   ============================================================ */
+const loadData = () => {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return DEFAULT_DATA;
+    const parsed = JSON.parse(raw);
+    const merged = { ...DEFAULT_DATA, ...parsed };
+    /* Migración v2.1→v2.2: añadir lotes FIFO si faltan + normalizar símbolo */
+    merged.holdings = merged.holdings.map(h => {
+      /* Normalizar símbolo SIEMPRE a uppercase trim */
+      if (h.symbol) h.symbol = String(h.symbol).trim().toUpperCase();
+      if (!h.lots && h.type !== 'cash') {
+        h.lots = [{
+          id: `lot_${h.id}_0`,
+          shares: h.shares,
+          costBasis: h.costBasis,
+          commission: h.commission || 0,
+          purchaseDate: h.purchaseDate,
+          txSnapshot: h.txSnapshot,
+          txTrms: h.txTrms
+        }];
+      }
+      return h;
+    });
+
+    /* Consolidación idempotente: siempre se ejecuta. Si no hay duplicados, no cambia nada. */
+    merged.holdings = consolidateHoldings(merged.holdings);
+    merged.version = APP_VERSION;
+    return merged;
+  } catch { return DEFAULT_DATA; }
+};
+
+/* Función reutilizable de consolidación por símbolo+type */
+const consolidateHoldings = (holdings) => {
+  const consolidated = [];
+  const bySymbol = {};
+  holdings.forEach(h => {
+    const symbolKey = (h.symbol || '').trim().toUpperCase();
+    if (!symbolKey) return;
+    const key = `${symbolKey}__${h.type}`;
+    if (!bySymbol[key]) {
+      bySymbol[key] = { ...h, symbol: symbolKey, lots: [...(h.lots || [])] };
+      consolidated.push(bySymbol[key]);
+    } else {
+      const existing = bySymbol[key];
+      existing.lots = [...existing.lots, ...(h.lots || [])];
+      existing.shares = existing.lots.reduce((s, l) => s + l.shares, 0);
+      if (h.currentPrice && !existing.currentPrice) existing.currentPrice = h.currentPrice;
+      if (h.category && (!existing.category || existing.category === 'Otros')) existing.category = h.category;
+      if (h.notes && existing.notes !== h.notes && !(existing.notes || '').includes(h.notes)) {
+        existing.notes = (existing.notes ? existing.notes + ' | ' : '') + h.notes;
+      }
+    }
+  });
+  /* Ordenar lotes por fecha asc (FIFO) y asegurar ids únicos */
+  consolidated.forEach(h => {
+    if (h.lots) {
+      h.lots.sort((a, b) => (a.purchaseDate || '').localeCompare(b.purchaseDate || ''));
+      const seen = new Set();
+      h.lots.forEach((l, i) => {
+        if (!l.id || seen.has(l.id)) l.id = `lot_${h.id}_${i}_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
+        seen.add(l.id);
+      });
+    }
+  });
+  return consolidated;
+};
+const persistData = (d) => localStorage.setItem(STORAGE_KEY, JSON.stringify(d));
+
+const loadSnapshots = () => {
+  try { return JSON.parse(localStorage.getItem(SNAPSHOTS_KEY) || '[]'); }
+  catch { return []; }
+};
+const persistSnapshots = (s) => localStorage.setItem(SNAPSHOTS_KEY, JSON.stringify(s));
+
+const loadFundamentals = () => {
+  try { return JSON.parse(localStorage.getItem(FUNDAMENTALS_KEY) || '{}'); }
+  catch { return {}; }
+};
+const persistFundamentals = (f) => localStorage.setItem(FUNDAMENTALS_KEY, JSON.stringify(f));
+
+/* Normaliza la respuesta de Finnhub /stock/metric a un objeto plano con los 15 ratios elegidos */
+const normalizeMetrics = (raw) => {
+  if (!raw || !raw.metric) return null;
+  const m = raw.metric;
+  return {
+    /* Valoración */
+    per: m.peNormalizedAnnual ?? m.peTTM ?? m.peBasicExclExtraTTM ?? null,
+    peg: m.pegRatio ?? null,
+    ps: m.psTTM ?? null,
+    pb: m.pbAnnual ?? m.pbQuarterly ?? null,
+    evEbitda: m['enterpriseValueOverEBITDATTM'] ?? null,
+    /* Calidad */
+    roe: m.roeTTM ?? m.roeRfy ?? null,
+    roic: m.roicTTM ?? m.roiTTM ?? null,
+    marginOp: m.operatingMarginTTM ?? null,
+    debtToEquity: m['totalDebt/totalEquityAnnual'] ?? m['totalDebt/totalEquityQuarterly'] ?? null,
+    currentRatio: m.currentRatioAnnual ?? m.currentRatioQuarterly ?? null,
+    /* Crecimiento */
+    revGrowth: m.revenueGrowthTTMYoy ?? m.revenueGrowth5Y ?? null,
+    epsGrowth: m.epsGrowthTTMYoy ?? m.epsGrowth5Y ?? null,
+    divYield: m.dividendYieldIndicatedAnnual ?? m.currentDividendYieldTTM ?? null,
+    payoutRatio: m.payoutRatioAnnual ?? m.payoutRatioTTM ?? null,
+    beta: m.beta ?? null,
+    /* Adicional: 52W range */
+    week52High: m['52WeekHigh'] ?? null,
+    week52Low: m['52WeekLow'] ?? null,
+    /* Meta */
+    fetchedAt: Date.now()
+  };
+};
+
+/* ============================================================
+   BACKUP / EXPORT
+   ============================================================ */
+const downloadBlob = (content, filename, type) => {
+  const blob = new Blob([content], { type });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+};
+
+const downloadBackup = (data) => {
+  const payload = {
+    appVersion: APP_VERSION,
+    exportedAt: new Date().toISOString(),
+    data,
+    snapshots: loadSnapshots(),
+    fundamentals: loadFundamentals()
+  };
+  downloadBlob(JSON.stringify(payload, null, 2), `portfolio_backup_${new Date().toISOString().split('T')[0]}.json`, 'application/json');
+  localStorage.setItem(LAST_BACKUP_STORE, new Date().toISOString());
+};
+
+const csvRow = (arr) => arr.map(c => {
+  const s = String(c ?? '');
+  return s.includes(',') || s.includes('"') ? `"${s.replace(/"/g, '""')}"` : s;
+}).join(',');
+
+const exportLedgerCSV = (data, kind = 'all') => {
+  const rows = [];
+  rows.push(csvRow([
+    'Fecha', 'Tipo', 'Símbolo', 'Cantidad', 'Precio Unit. Nativo', 'Moneda Nativa',
+    'Comisión Nativa', 'Total Nativo',
+    'Total USD', 'Total EUR', 'Total COP',
+    'TRM USD/COP', 'TRM EUR/COP',
+    'Categoría', 'Notas'
+  ]));
+
+  if (kind === 'all' || kind === 'buys') {
+    data.holdings.forEach(h => {
+      if (h.type === 'cash') return;
+      (h.lots || [{ shares: h.shares, costBasis: h.costBasis, commission: h.commission, purchaseDate: h.purchaseDate, txSnapshot: h.txSnapshot, txTrms: h.txTrms }]).forEach(lot => {
+        const totalNativo = lot.shares * lot.costBasis + (lot.commission || 0);
+        const snap = lot.txSnapshot || { USD: 0, EUR: 0, COP: 0 };
+        const trms = lot.txTrms || data.trms;
+        rows.push(csvRow([
+          lot.purchaseDate || '', 'COMPRA', h.symbol, lot.shares, lot.costBasis, h.currency,
+          lot.commission || 0, totalNativo.toFixed(2),
+          (snap.USD || 0).toFixed(2), (snap.EUR || 0).toFixed(2), (snap.COP || 0).toFixed(2),
+          trms.USD || '', trms.EUR || '', h.category || '', h.notes || ''
+        ]));
+      });
+    });
+  }
+  if (kind === 'all' || kind === 'sales') {
+    (data.sales || []).forEach(s => {
+      const totalNativo = s.shares * s.sellPrice - (s.commission || 0);
+      const snap = s.txSnapshot || { USD: 0, EUR: 0, COP: 0 };
+      const trms = s.txTrms || data.trms;
+      rows.push(csvRow([
+        s.date || '', 'VENTA', s.symbol, s.shares, s.sellPrice, s.currency || 'USD',
+        s.commission || 0, totalNativo.toFixed(2),
+        (snap.USD || 0).toFixed(2), (snap.EUR || 0).toFixed(2), (snap.COP || 0).toFixed(2),
+        trms.USD || '', trms.EUR || '', '', s.notes || ''
+      ]));
+    });
+  }
+  if (kind === 'all' || kind === 'dividends') {
+    (data.dividends || []).forEach(d => {
+      const snap = d.txSnapshot || { USD: 0, EUR: 0, COP: 0 };
+      const trms = d.txTrms || data.trms;
+      rows.push(csvRow([
+        d.date || '', 'DIVIDENDO', d.symbol, '', '', d.currency || 'USD', '',
+        (d.amount || 0).toFixed(2),
+        (snap.USD || 0).toFixed(2), (snap.EUR || 0).toFixed(2), (snap.COP || 0).toFixed(2),
+        trms.USD || '', trms.EUR || '', '', d.notes || ''
+      ]));
+    });
+  }
+
+  const filename = `libro_contable_${kind}_${new Date().toISOString().split('T')[0]}.csv`;
+  downloadBlob('\ufeff' + rows.join('\n'), filename, 'text/csv;charset=utf-8');
+};
+
+const validateBackup = (parsed) => {
+  if (!parsed || typeof parsed !== 'object') return { ok: false, err: 'Archivo no válido' };
+  const d = parsed.data || parsed;
+  if (!Array.isArray(d.holdings)) return { ok: false, err: 'Falta campo "holdings"' };
+  if (!d.trms) return { ok: false, err: 'Falta campo "trms"' };
+  return { ok: true, data: d, snapshots: parsed.snapshots || [], fundamentals: parsed.fundamentals || {} };
+};
+
+/* ============================================================
+   API CLIENTS
+   ============================================================ */
+const finnhub = {
+  quote: async (symbol, key) => {
+    const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${symbol}&token=${key}`);
+    if (!r.ok) throw new Error('Finnhub quote error');
+    return r.json();
+  },
+  candles: async (symbol, key, resolution = 'D', days = 30) => {
+    const to = Math.floor(Date.now() / 1000);
+    const from = to - days * 86400;
+    const r = await fetch(`https://finnhub.io/api/v1/stock/candle?symbol=${symbol}&resolution=${resolution}&from=${from}&to=${to}&token=${key}`);
+    if (!r.ok) return { s: 'no_data' };
+    return r.json();
+  },
+  news: async (symbol, key) => {
+    const today = new Date().toISOString().split('T')[0];
+    const weekAgo = new Date(Date.now() - 7 * 86400000).toISOString().split('T')[0];
+    const r = await fetch(`https://finnhub.io/api/v1/company-news?symbol=${symbol}&from=${weekAgo}&to=${today}&token=${key}`);
+    if (!r.ok) return [];
+    return r.json();
+  },
+  earnings: async (key, days = 30) => {
+    const today = new Date().toISOString().split('T')[0];
+    const future = new Date(Date.now() + days * 86400000).toISOString().split('T')[0];
+    const r = await fetch(`https://finnhub.io/api/v1/calendar/earnings?from=${today}&to=${future}&token=${key}`);
+    if (!r.ok) return { earningsCalendar: [] };
+    return r.json();
+  },
+  metric: async (symbol, key) => {
+    /* Devuelve un objeto con docenas de ratios. Free tier lo soporta. */
+    const r = await fetch(`https://finnhub.io/api/v1/stock/metric?symbol=${symbol}&metric=all&token=${key}`);
+    if (!r.ok) return null;
+    return r.json();
+  }
+};
+
+/* FX rates en tiempo real desde frankfurter.app (BCE oficial, sin API key, CORS abierto) */
+const fxRates = {
+  /* Devuelve { USD: cop_per_usd, EUR: cop_per_eur } */
+  fetchCOP: async () => {
+    try {
+      /* USD→COP y EUR→COP en una sola llamada */
+      const r = await fetch('https://api.frankfurter.app/latest?from=USD&to=COP,EUR');
+      if (!r.ok) throw new Error('frankfurter error');
+      const j = await r.json();
+      const usdCop = j.rates?.COP;
+      const usdEur = j.rates?.EUR;
+      if (!usdCop || !usdEur) throw new Error('rates missing');
+      /* EUR→COP = (USD→COP) / (USD→EUR) */
+      const eurCop = usdCop / usdEur;
+      return { USD: usdCop, EUR: eurCop, source: 'BCE', date: j.date };
+    } catch (e) {
+      /* Fallback: exchangerate.host */
+      try {
+        const r = await fetch('https://api.exchangerate-api.com/v4/latest/USD');
+        if (!r.ok) throw new Error('fallback error');
+        const j = await r.json();
+        return { USD: j.rates?.COP, EUR: j.rates?.COP / j.rates?.EUR, source: 'fallback', date: j.date };
+      } catch { return null; }
+    }
+  }
+};
+
+const macro = {
+  fetchStooq: async (symbol) => {
+    try {
+      const r = await fetch(`https://stooq.com/q/l/?s=${symbol}&f=sd2t2ohlcv&h&e=csv`);
+      if (!r.ok) return null;
+      const text = await r.text();
+      const lines = text.trim().split('\n');
+      if (lines.length < 2) return null;
+      const cols = lines[1].split(',');
+      const close = parseFloat(cols[6]);
+      const open = parseFloat(cols[3]);
+      return { close, change: close - open, changePct: ((close - open) / open) * 100 };
+    } catch { return null; }
+  },
+  btc: async () => {
+    try {
+      const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true');
+      const j = await r.json();
+      return { close: j.bitcoin.usd, changePct: j.bitcoin.usd_24h_change };
+    } catch { return null; }
+  }
+};
+
+const claudeApi = {
+  classifyNews: async (apiKey, items) => {
+    const prompt = `Eres un analista de inversión institucional. Clasifica cada noticia para un portafolio de largo plazo (10+ años, growth/tech).
+
+Para CADA noticia devuelve:
+- impact: "red" (material), "yellow" (relevante), "white" (ruido)
+- reasoning: 1 frase en español
+- direction: "bullish", "bearish", "neutral"
+
+Devuelve SOLO JSON array sin markdown:
+[{"impact":"red","reasoning":"...","direction":"bullish"}, ...]
+
+Noticias:
+${items.map((n, i) => `${i + 1}. [${n.symbol}] ${n.headline}\n   ${(n.summary || '').slice(0, 200)}`).join('\n\n')}`;
+
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true'
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 2000,
+        messages: [{ role: 'user', content: prompt }]
+      })
+    });
+    if (!r.ok) throw new Error(`Claude API: ${r.status}`);
+    const data = await r.json();
+    const text = data.content.filter(c => c.type === 'text').map(c => c.text).join('');
+    return JSON.parse(text.replace(/```json|```/g, '').trim());
+  }
+};
+
+/* ============================================================
+   COMPONENTES BASE
+   ============================================================ */
+const Sparkline = ({ data, width = 80, height = 24 }) => {
+  if (!data || data.length < 2) return <div style={{ width, height }} className="text-slate-600 text-xs">—</div>;
+  const min = Math.min(...data), max = Math.max(...data);
+  const range = max - min || 1;
+  const points = data.map((v, i) => {
+    const x = (i / (data.length - 1)) * width;
+    const y = height - ((v - min) / range) * height;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+  const stroke = data[data.length - 1] >= data[0] ? '#22c55e' : '#ef4444';
+  return <svg width={width} height={height}><polyline points={points} fill="none" stroke={stroke} strokeWidth="1.5" /></svg>;
+};
+
+/* Semáforo para ratios fundamentales.
+   Rangos basados en consensos de análisis fundamental para empresas growth/tech US.
+   Devuelve: 'good' (verde), 'neutral' (gris), 'warn' (amarillo), 'bad' (rojo) */
+const scoreRatio = (key, value) => {
+  if (value === null || value === undefined || isNaN(value)) return 'neutral';
+  const v = Number(value);
+  switch (key) {
+    case 'per':
+      if (v < 0) return 'bad'; /* pérdidas */
+      if (v < 15) return 'good';
+      if (v < 30) return 'neutral';
+      if (v < 50) return 'warn';
+      return 'bad';
+    case 'peg':
+      if (v < 0) return 'bad';
+      if (v < 1) return 'good';
+      if (v < 2) return 'neutral';
+      return 'warn';
+    case 'ps':
+      if (v < 2) return 'good';
+      if (v < 8) return 'neutral';
+      if (v < 15) return 'warn';
+      return 'bad';
+    case 'pb':
+      if (v < 1.5) return 'good';
+      if (v < 4) return 'neutral';
+      return 'warn';
+    case 'evEbitda':
+      if (v < 10) return 'good';
+      if (v < 20) return 'neutral';
+      if (v < 35) return 'warn';
+      return 'bad';
+    case 'roe':
+      if (v > 20) return 'good';
+      if (v > 10) return 'neutral';
+      if (v > 0) return 'warn';
+      return 'bad';
+    case 'roic':
+      if (v > 15) return 'good';
+      if (v > 8) return 'neutral';
+      if (v > 0) return 'warn';
+      return 'bad';
+    case 'marginOp':
+      if (v > 20) return 'good';
+      if (v > 10) return 'neutral';
+      if (v > 0) return 'warn';
+      return 'bad';
+    case 'debtToEquity':
+      if (v < 0.5) return 'good';
+      if (v < 1.5) return 'neutral';
+      if (v < 3) return 'warn';
+      return 'bad';
+    case 'currentRatio':
+      if (v > 2) return 'good';
+      if (v > 1) return 'neutral';
+      return 'bad';
+    case 'revGrowth':
+      if (v > 20) return 'good';
+      if (v > 5) return 'neutral';
+      if (v > 0) return 'warn';
+      return 'bad';
+    case 'epsGrowth':
+      if (v > 15) return 'good';
+      if (v > 0) return 'neutral';
+      return 'bad';
+    case 'divYield':
+      if (v > 3) return 'good';
+      if (v > 1) return 'neutral';
+      return 'warn';
+    case 'payoutRatio':
+      if (v > 0 && v < 60) return 'good';
+      if (v < 80) return 'neutral';
+      return 'warn';
+    case 'beta':
+      if (v < 1) return 'good';
+      if (v < 1.5) return 'neutral';
+      if (v < 2) return 'warn';
+      return 'bad';
+    default: return 'neutral';
+  }
+};
+
+const scoreColor = (score) => ({
+  good: 'text-green-400 border-green-700/50 bg-green-950/20',
+  neutral: 'text-slate-300 border-slate-700 bg-slate-900/40',
+  warn: 'text-amber-400 border-amber-700/50 bg-amber-950/20',
+  bad: 'text-red-400 border-red-700/50 bg-red-950/20'
+}[score] || 'text-slate-300 border-slate-700');
+
+/* Formato adaptativo para cada ratio */
+const fmtRatio = (key, value) => {
+  if (value === null || value === undefined || isNaN(value)) return '—';
+  const v = Number(value);
+  const pctKeys = ['roe', 'roic', 'marginOp', 'revGrowth', 'epsGrowth', 'divYield', 'payoutRatio'];
+  if (pctKeys.includes(key)) return `${v.toFixed(1)}%`;
+  return v.toFixed(2);
+};
+
+/* Diccionario de metadata por ratio: label corto + tooltip explicativo */
+const RATIO_META = {
+  per: { label: 'PER (TTM)', tip: 'Price/Earnings. Cuántos años de beneficios necesitas para recuperar la inversión. <15 barato, >30 caro' },
+  peg: { label: 'PEG', tip: 'PER ajustado a crecimiento. <1 indica que el precio está justificado por el crecimiento esperado' },
+  ps: { label: 'P/S', tip: 'Price/Sales. Útil para empresas no rentables. <2 barato, >15 muy caro' },
+  pb: { label: 'P/B', tip: 'Price/Book. Precio vs valor contable. Más relevante en bancos/industria que en tech' },
+  evEbitda: { label: 'EV/EBITDA', tip: 'Enterprise Value / EBITDA. El ratio favorito de gestores. <10 barato, >20 caro' },
+  roe: { label: 'ROE', tip: 'Return on Equity. Rentabilidad sobre capital propio. >20% excelente, <10% pobre' },
+  roic: { label: 'ROIC', tip: 'Return on Invested Capital. Mejor indicador de eficiencia del capital. >15% indica ventaja competitiva' },
+  marginOp: { label: 'Margen Op.', tip: 'Margen operativo TTM. >20% excelente, indica poder de fijación de precios' },
+  debtToEquity: { label: 'Deuda/Equity', tip: 'Apalancamiento. <0.5 conservador, >3 riesgo financiero alto' },
+  currentRatio: { label: 'Current Ratio', tip: 'Liquidez corto plazo. >2 holgada, <1 problema de caja' },
+  revGrowth: { label: 'Ingresos YoY', tip: 'Crecimiento de ingresos vs año anterior. >20% growth fuerte, <5% madura' },
+  epsGrowth: { label: 'EPS YoY', tip: 'Crecimiento del beneficio por acción. Indicador clave de momentum financiero' },
+  divYield: { label: 'Div. Yield', tip: 'Rentabilidad por dividendo anual. Tech rara vez supera 2%, utilities 3-5%' },
+  payoutRatio: { label: 'Payout Ratio', tip: 'Porcentaje del beneficio que se reparte como dividendo. >80% insostenible largo plazo' },
+  beta: { label: 'Beta', tip: 'Volatilidad vs S&P 500. 1.0 = se mueve igual que el mercado, >1.5 más volátil' }
+};
+
+/* FundamentalsGrid: muestra los 15 ratios en 3 columnas con semáforos */
+const FundamentalsGrid = ({ metrics, currentPrice }) => {
+  if (!metrics) return (
+    <div className="bg-slate-950/50 border border-slate-800 rounded-lg p-4 text-center text-xs text-slate-500">
+      <i className="fa-solid fa-database mr-1"></i>Fundamentales no disponibles. Pulsa "Actualizar" para descargarlos desde Finnhub.
+    </div>
+  );
+
+  const categories = [
+    { name: 'Valoración', icon: 'fa-tag', color: 'text-indigo-400', keys: ['per', 'peg', 'ps', 'pb', 'evEbitda'] },
+    { name: 'Calidad', icon: 'fa-award', color: 'text-cyan-400', keys: ['roe', 'roic', 'marginOp', 'debtToEquity', 'currentRatio'] },
+    { name: 'Crecimiento', icon: 'fa-arrow-trend-up', color: 'text-amber-400', keys: ['revGrowth', 'epsGrowth', 'divYield', 'payoutRatio', 'beta'] }
+  ];
+
+  /* 52W range visual */
+  const renderRange = () => {
+    if (!metrics.week52High || !metrics.week52Low || !currentPrice) return null;
+    const range = metrics.week52High - metrics.week52Low;
+    if (range <= 0) return null;
+    const pos = ((currentPrice - metrics.week52Low) / range) * 100;
+    const clampedPos = Math.max(0, Math.min(100, pos));
+    return (
+      <div className="mt-3 bg-slate-900/60 border border-slate-700 rounded p-2.5">
+        <div className="flex justify-between items-center text-xs mb-1.5">
+          <span className="text-slate-400">52W Range</span>
+          <span className="text-slate-300 font-mono">{fmt(clampedPos, 0)}% del rango anual</span>
+        </div>
+        <div className="relative h-2 bg-slate-800 rounded">
+          <div className="absolute h-full bg-gradient-to-r from-red-700 via-yellow-600 to-green-700 rounded opacity-60" style={{ width: '100%' }}></div>
+          <div className="absolute h-4 w-1 bg-white -top-1 rounded shadow-lg" style={{ left: `${clampedPos}%`, transform: 'translateX(-50%)' }}></div>
+        </div>
+        <div className="flex justify-between text-[10px] mt-1 font-mono">
+          <span className="text-red-400">${fmt(metrics.week52Low)}</span>
+          <span className="text-slate-500">↑ {fmt(currentPrice)}</span>
+          <span className="text-green-400">${fmt(metrics.week52High)}</span>
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div>
+      <div className="text-xs text-slate-400 mb-2 uppercase tracking-wider"><i className="fa-solid fa-chart-pie mr-1 text-purple-400"></i>Fundamentales (Finnhub)</div>
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+        {categories.map(cat => (
+          <div key={cat.name} className="bg-slate-900/60 border border-slate-800 rounded-lg p-2.5">
+            <div className={`text-xs font-bold uppercase tracking-wider mb-1.5 ${cat.color}`}>
+              <i className={`fa-solid ${cat.icon} mr-1`}></i>{cat.name}
+            </div>
+            <div className="space-y-1">
+              {cat.keys.map(k => {
+                const meta = RATIO_META[k];
+                const v = metrics[k];
+                const score = scoreRatio(k, v);
+                return (
+                  <div key={k} className={`flex justify-between items-center px-2 py-1 rounded border ${scoreColor(score)}`} title={meta.tip}>
+                    <span className="text-xs">{meta.label}</span>
+                    <span className="text-xs font-mono font-bold">{fmtRatio(k, v)}</span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+      </div>
+      {renderRange()}
+      <div className="text-[10px] text-slate-600 mt-2 italic">
+        Actualizado: {metrics.fetchedAt ? new Date(metrics.fetchedAt).toLocaleString('es-ES') : '—'} · Pasa el cursor por cada ratio para ver explicación
+      </div>
+    </div>
+  );
+};
+
+/* TREEMAP profesional - DIVs HTML posicionados, texto que respeta el contenedor, responsive */
+const Treemap = ({ items, height = 400, viewCurrency = 'USD' }) => {
+  const [hover, setHover] = useState(null);
+  const [dims, setDims] = useState({ w: 1000, h: height });
+  const containerRef = useRef(null);
+
+  /* Medir el ancho real del contenedor (responsive) */
+  useEffect(() => {
+    const measure = () => {
+      if (containerRef.current) {
+        const w = containerRef.current.clientWidth;
+        setDims({ w: Math.max(100, w), h: height });
+      }
+    };
+    measure();
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, [height]);
+
+  if (!items.length) return <div className="text-center text-slate-500 py-12 text-sm">Sin datos para visualizar.</div>;
+  const filtered = items.filter(it => it.value > 0);
+  if (!filtered.length) return null;
+
+  /* Squarified treemap simplificado y robusto */
+  const sorted = [...filtered].sort((a, b) => b.value - a.value);
+  const total = sorted.reduce((s, x) => s + x.value, 0);
+  const layout = [];
+  const totalArea = dims.w * dims.h;
+  const scale = totalArea / total;
+
+  const worstAspect = (row, sideLen) => {
+    if (!row.length) return Infinity;
+    const sum = row.reduce((s, r) => s + r.value, 0) * scale;
+    const rowMin = Math.min(...row.map(r => r.value)) * scale;
+    const rowMax = Math.max(...row.map(r => r.value)) * scale;
+    const w2 = sideLen * sideLen;
+    return Math.max((w2 * rowMax) / (sum * sum), (sum * sum) / (w2 * rowMin));
+  };
+
+  const placeRow = (row, rect) => {
+    const sum = row.reduce((s, r) => s + r.value, 0) * scale;
+    const isHoriz = rect.w >= rect.h;
+    if (isHoriz) {
+      const rowW = sum / rect.h;
+      let off = 0;
+      row.forEach(it => {
+        const h = it.value * scale / rowW;
+        layout.push({ ...it, x: rect.x, y: rect.y + off, w: rowW, h });
+        off += h;
+      });
+      return { x: rect.x + rowW, y: rect.y, w: Math.max(0, rect.w - rowW), h: rect.h };
+    } else {
+      const rowH = sum / rect.w;
+      let off = 0;
+      row.forEach(it => {
+        const w = it.value * scale / rowH;
+        layout.push({ ...it, x: rect.x + off, y: rect.y, w, h: rowH });
+        off += w;
+      });
+      return { x: rect.x, y: rect.y + rowH, w: rect.w, h: Math.max(0, rect.h - rowH) };
+    }
+  };
+
+  let rect = { x: 0, y: 0, w: dims.w, h: dims.h };
+  let row = [];
+  let remaining = [...sorted];
+  while (remaining.length) {
+    const sideLen = Math.min(rect.w, rect.h);
+    if (sideLen <= 0) break;
+    const next = remaining[0];
+    const trial = [...row, next];
+    if (row.length === 0 || worstAspect(trial, sideLen) <= worstAspect(row, sideLen)) {
+      row.push(next);
+      remaining.shift();
+    } else {
+      rect = placeRow(row, rect);
+      row = [];
+    }
+  }
+  if (row.length) placeRow(row, rect);
+
+  /* HSL gradient continuo: P/L total largo plazo. Rango ±50% */
+  const colorFor = (pct) => {
+    const clamped = Math.max(-50, Math.min(50, pct || 0));
+    const intensity = Math.abs(clamped) / 50;
+    if (Math.abs(clamped) < 1) return { fill: '#334155', stroke: '#475569' };
+    if (clamped > 0) {
+      const lightness = 30 - intensity * 10;
+      const saturation = 45 + intensity * 35;
+      return { fill: `hsl(142, ${saturation}%, ${lightness}%)`, stroke: `hsl(142, ${saturation}%, ${lightness + 12}%)` };
+    }
+    const lightness = 34 - intensity * 10;
+    const saturation = 55 + intensity * 30;
+    return { fill: `hsl(0, ${saturation}%, ${lightness}%)`, stroke: `hsl(0, ${saturation}%, ${lightness + 12}%)` };
+  };
+
+  const handleMove = (e, b) => {
+    const r = containerRef.current?.getBoundingClientRect();
+    if (!r) return;
+    setHover({ ...b, mouseX: e.clientX - r.left, mouseY: e.clientY - r.top });
+  };
+
+  return (
+    <div ref={containerRef} style={{ width: '100%', height, position: 'relative', background: '#020617', borderRadius: 6, overflow: 'hidden' }} onMouseLeave={() => setHover(null)}>
+      {layout.map((b, i) => {
+        const c = colorFor(b.plPct || 0);
+        /* Tipografía adaptativa basada en dimensión más corta */
+        const minSide = Math.min(b.w, b.h);
+        const fs = Math.max(8, Math.min(22, minSide / 4.5));
+        /* Decidir qué mostrar según área */
+        const showSymbol = b.w > 30 && b.h > 18;
+        const showPct = b.w > 50 && b.h > 38;
+        const showWeight = b.w > 70 && b.h > 60;
+        const isHovered = hover && hover.symbol === b.symbol;
+        return (
+          <div key={i}
+            onMouseMove={e => handleMove(e, b)}
+            onMouseEnter={e => handleMove(e, b)}
+            style={{
+              position: 'absolute',
+              left: b.x + 1, top: b.y + 1,
+              width: Math.max(0, b.w - 2), height: Math.max(0, b.h - 2),
+              background: `linear-gradient(to bottom, ${c.stroke}, ${c.fill})`,
+              border: isHovered ? '2px solid #fff' : '1px solid #020617',
+              borderRadius: 4,
+              cursor: 'pointer',
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'center',
+              overflow: 'hidden',
+              padding: 2,
+              boxSizing: 'border-box',
+              transition: 'border 0.15s',
+              userSelect: 'none'
+            }}>
+            {showSymbol && (
+              <div style={{
+                fontSize: fs,
+                fontWeight: 700,
+                color: '#fff',
+                textShadow: '0 1px 2px rgba(0,0,0,0.7)',
+                lineHeight: 1.05,
+                maxWidth: '100%',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+                textAlign: 'center'
+              }}>{b.symbol}</div>
+            )}
+            {showPct && (
+              <div style={{
+                fontSize: fs * 0.55,
+                fontWeight: 500,
+                color: '#fff',
+                opacity: 0.95,
+                textShadow: '0 1px 2px rgba(0,0,0,0.7)',
+                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                whiteSpace: 'nowrap'
+              }}>{fmtPct(b.plPct || 0)}</div>
+            )}
+            {showWeight && (
+              <div style={{
+                fontSize: fs * 0.45,
+                color: '#fff',
+                opacity: 0.75,
+                textShadow: '0 1px 2px rgba(0,0,0,0.7)',
+                fontFamily: 'ui-monospace, monospace',
+                whiteSpace: 'nowrap'
+              }}>{(b.weight * 100).toFixed(1)}%</div>
+            )}
+          </div>
+        );
+      })}
+      {hover && (
+        <div className="absolute pointer-events-none bg-slate-950/95 border border-slate-600 rounded-lg shadow-2xl px-3 py-2 text-xs z-20 min-w-[170px]"
+          style={{
+            left: Math.min(hover.mouseX + 14, dims.w - 190),
+            top: Math.min(hover.mouseY + 14, height - 140)
+          }}>
+          <div className="font-bold text-cyan-400 text-sm mb-1">{hover.symbol}</div>
+          <div className="space-y-0.5">
+            <div className="flex justify-between gap-3"><span className="text-slate-400">Valor:</span><span className="font-mono text-white">{fmtMoney(hover.value, viewCurrency)}</span></div>
+            <div className="flex justify-between gap-3"><span className="text-slate-400">P/L total:</span><span className={`font-mono ${(hover.plPct || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{fmtPct(hover.plPct || 0)}</span></div>
+            {hover.cagr !== null && hover.cagr !== undefined && <div className="flex justify-between gap-3"><span className="text-slate-400">CAGR:</span><span className={`font-mono ${(hover.cagr || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{fmtPct(hover.cagr)}</span></div>}
+            <div className="flex justify-between gap-3"><span className="text-slate-400">% Día:</span><span className={`font-mono ${(hover.changePct || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{fmtPct(hover.changePct || 0)}</span></div>
+            <div className="flex justify-between gap-3"><span className="text-slate-400">% Portfolio:</span><span className="font-mono text-white">{(hover.weight * 100).toFixed(2)}%</span></div>
+            {hover.category && <div className="flex justify-between gap-3"><span className="text-slate-400">Categoría:</span><span className="text-slate-300">{hover.category}</span></div>}
+          </div>
+        </div>
+      )}
+      <div className="absolute bottom-2 left-2 flex items-center gap-2 text-[10px] bg-slate-950/80 backdrop-blur rounded px-2 py-1">
+        <span className="text-slate-400">P/L:</span>
+        <div className="flex items-center gap-0.5">
+          <span style={{ background: 'hsl(0, 85%, 24%)' }} className="w-4 h-3 rounded-sm"></span>
+          <span style={{ background: 'hsl(0, 65%, 30%)' }} className="w-4 h-3"></span>
+          <span style={{ background: '#334155' }} className="w-4 h-3"></span>
+          <span style={{ background: 'hsl(142, 60%, 25%)' }} className="w-4 h-3"></span>
+          <span style={{ background: 'hsl(142, 80%, 20%)' }} className="w-4 h-3 rounded-sm"></span>
+        </div>
+        <span className="text-slate-500">−50%</span><span className="text-slate-500">0</span><span className="text-slate-500">+50%</span>
+      </div>
+    </div>
+  );
+};
+
+/* GRÁFICO DE LÍNEA - patrimonio en el tiempo */
+const LineChart = ({ data, width = 800, height = 240, label = 'Valor' }) => {
+  if (!data || data.length < 2) {
+    return <div className="text-center text-slate-500 py-12 text-sm">Acumulando datos... Necesitas al menos 2 snapshots para ver evolución. Los snapshots se generan automáticamente al actualizar precios.</div>;
+  }
+  const padding = { top: 20, right: 20, bottom: 30, left: 60 };
+  const innerW = width - padding.left - padding.right;
+  const innerH = height - padding.top - padding.bottom;
+  const values = data.map(d => d.value);
+  const min = Math.min(...values), max = Math.max(...values);
+  const range = max - min || 1;
+
+  const points = data.map((d, i) => {
+    const x = padding.left + (i / (data.length - 1)) * innerW;
+    const y = padding.top + innerH - ((d.value - min) / range) * innerH;
+    return { x, y, ...d };
+  });
+
+  const path = points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(' ');
+  const areaPath = `${path} L ${points[points.length - 1].x.toFixed(1)} ${padding.top + innerH} L ${padding.left} ${padding.top + innerH} Z`;
+  const first = data[0].value, last = data[data.length - 1].value;
+  const up = last >= first;
+  const color = up ? '#22c55e' : '#ef4444';
+
+  const yTicks = 4;
+  const tickValues = Array.from({ length: yTicks + 1 }, (_, i) => min + (range * i / yTicks));
+
+  return (
+    <svg width="100%" height={height} viewBox={`0 0 ${width} ${height}`}>
+      <defs>
+        <linearGradient id="grad" x1="0" x2="0" y1="0" y2="1">
+          <stop offset="0%" stopColor={color} stopOpacity="0.3" />
+          <stop offset="100%" stopColor={color} stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      {tickValues.map((v, i) => {
+        const y = padding.top + innerH - ((v - min) / range) * innerH;
+        return (
+          <g key={i}>
+            <line x1={padding.left} x2={width - padding.right} y1={y} y2={y} stroke="#1e293b" strokeWidth="1" />
+            <text x={padding.left - 8} y={y + 3} textAnchor="end" fill="#64748b" fontSize="10">{fmt(v, 0)}</text>
+          </g>
+        );
+      })}
+      <path d={areaPath} fill="url(#grad)" />
+      <path d={path} fill="none" stroke={color} strokeWidth="2" />
+      {data.length <= 30 && points.map((p, i) => (
+        <circle key={i} cx={p.x} cy={p.y} r="2.5" fill={color} />
+      ))}
+      <text x={padding.left} y={15} fill="#94a3b8" fontSize="11">{data[0].date}</text>
+      <text x={width - padding.right} y={15} fill="#94a3b8" fontSize="11" textAnchor="end">{data[data.length - 1].date}</text>
+    </svg>
+  );
+};
+
+/* ============================================================
+   MODAL POSICIÓN (con FIFO: añade lote en vez de sobreescribir)
+   ============================================================ */
+const PositionModal = ({ open, onClose, onSave, holdingToEdit, lotToEdit, currentTrms, mode = 'newPosition' /* newPosition | addLot | editLot */ }) => {
+  const [txTrms, setTxTrms] = useState(currentTrms);
+  const [preview, setPreview] = useState({ USD: 0, EUR: 0, COP: 0 });
+  const formRef = useRef(null);
+
+  useEffect(() => {
+    if (open) setTxTrms(lotToEdit?.txTrms || currentTrms);
+  }, [open, lotToEdit, currentTrms]);
+
+  const recalcPreview = () => {
+    const f = formRef.current; if (!f) return;
+    const shares = parseFloat(f.shares?.value) || 0;
+    const cost = parseFloat(f.costBasis?.value) || 0;
+    const comm = parseFloat(f.commission?.value) || 0;
+    const cur = f.currency?.value || holdingToEdit?.currency || 'USD';
+    setPreview(snapshotMultiCurrency(shares * cost + comm, cur, txTrms));
+  };
+
+  useEffect(() => { recalcPreview(); /* eslint-disable-next-line */ }, [txTrms, open]);
+
+  if (!open) return null;
+
+  const isEditingLot = mode === 'editLot';
+  const isAddingLot = mode === 'addLot';
+  const isNewPosition = mode === 'newPosition';
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const shares = parseFloat(f.get('shares'));
+    const costBasis = parseFloat(f.get('costBasis'));
+    const commission = parseFloat(f.get('commission') || 0);
+    const currency = isNewPosition ? f.get('currency') : holdingToEdit.currency;
+    const totalNativo = shares * costBasis + commission;
+    const txSnapshot = snapshotMultiCurrency(totalNativo, currency, txTrms);
+
+    const newLot = {
+      id: lotToEdit?.id || `lot_${Date.now()}`,
+      shares, costBasis, commission,
+      purchaseDate: f.get('purchaseDate'),
+      txSnapshot, txTrms: { ...txTrms }
+    };
+
+    if (isNewPosition) {
+      const newH = {
+        id: `h_${Date.now()}`,
+        type: f.get('type'),
+        symbol: f.get('symbol').toUpperCase(),
+        currency,
+        currentPrice: parseFloat(f.get('currentPrice')),
+        category: f.get('category') || 'Otros',
+        notes: f.get('notes') || '',
+        shares,
+        costBasis, /* mantener para compatibilidad */
+        commission,
+        purchaseDate: newLot.purchaseDate,
+        lots: [newLot],
+        txSnapshot, txTrms: { ...txTrms }
+      };
+      onSave({ mode: 'newPosition', holding: newH });
+    } else if (isAddingLot) {
+      onSave({ mode: 'addLot', holdingId: holdingToEdit.id, lot: newLot, currentPrice: parseFloat(f.get('currentPrice')) });
+    } else if (isEditingLot) {
+      onSave({ mode: 'editLot', holdingId: holdingToEdit.id, lot: newLot });
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4 animate-fade-in">
+      <div className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto">
+        <div className="p-4 border-b border-slate-800 flex justify-between items-center sticky top-0 bg-slate-900 z-10">
+          <h3 className="font-bold text-indigo-400">
+            {isNewPosition && 'Nueva Posición'}
+            {isAddingLot && `Añadir compra a ${holdingToEdit.symbol}`}
+            {isEditingLot && `Editar lote de ${holdingToEdit.symbol}`}
+          </h3>
+          <button onClick={onClose}><i className="fa-solid fa-xmark text-xl"></i></button>
+        </div>
+        <form ref={formRef} onSubmit={handleSubmit} onChange={recalcPreview} className="p-4 space-y-3 text-sm">
+          {isNewPosition && (
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="text-xs text-slate-400">Tipo</label>
+                <select name="type" defaultValue="asset" className="w-full bg-slate-950 border border-slate-700 rounded p-2">
+                  <option value="asset">Activo</option><option value="cash">Efectivo</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-xs text-slate-400">Símbolo</label>
+                <input name="symbol" required className="w-full bg-slate-950 border border-slate-700 rounded p-2" />
+              </div>
+            </div>
+          )}
+          <div className="grid grid-cols-3 gap-3">
+            <div><label className="text-xs text-slate-400">Cantidad</label><input name="shares" type="number" step="any" required defaultValue={lotToEdit?.shares} className="w-full bg-slate-950 border border-slate-700 rounded p-2" /></div>
+            <div><label className="text-xs text-slate-400">Costo unit.</label><input name="costBasis" type="number" step="any" required defaultValue={lotToEdit?.costBasis} className="w-full bg-slate-950 border border-slate-700 rounded p-2" /></div>
+            <div><label className="text-xs text-slate-400">Comisión</label><input name="commission" type="number" step="any" defaultValue={lotToEdit?.commission || 0} className="w-full bg-slate-950 border border-slate-700 rounded p-2" /></div>
+          </div>
+          <div className="grid grid-cols-3 gap-3">
+            {isNewPosition && (
+              <div>
+                <label className="text-xs text-slate-400">Moneda</label>
+                <select name="currency" defaultValue="USD" className="w-full bg-slate-950 border border-slate-700 rounded p-2"><option>USD</option><option>EUR</option><option>COP</option></select>
+              </div>
+            )}
+            <div><label className="text-xs text-slate-400">Fecha</label><input name="purchaseDate" type="date" required defaultValue={lotToEdit?.purchaseDate || new Date().toISOString().split('T')[0]} className="w-full bg-slate-950 border border-slate-700 rounded p-2" /></div>
+            {(isNewPosition || isAddingLot) && (
+              <div><label className="text-xs text-slate-400">Precio actual</label><input name="currentPrice" type="number" step="any" required defaultValue={holdingToEdit?.currentPrice} className="w-full bg-slate-950 border border-slate-700 rounded p-2" /></div>
+            )}
+          </div>
+          {isNewPosition && (
+            <>
+              <div>
+                <label className="text-xs text-slate-400">Categoría</label>
+                <select name="category" defaultValue="AI/Big Tech" className="w-full bg-slate-950 border border-slate-700 rounded p-2">
+                  <option>AI/Big Tech</option><option>FinTech</option><option>ETF</option><option>Healthcare</option><option>Oro</option><option>Crypto</option><option>Cash</option><option>Otros</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-xs text-slate-400">Notas</label>
+                <input name="notes" placeholder="Ej: Broker XTB" className="w-full bg-slate-950 border border-slate-700 rounded p-2" />
+              </div>
+            </>
+          )}
+
+          <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-3 space-y-2">
+            <div className="flex items-center justify-between">
+              <div className="text-xs font-bold text-amber-400 uppercase tracking-wider"><i className="fa-solid fa-scale-balanced mr-1"></i>TRMs de la operación</div>
+              <button type="button" onClick={() => setTxTrms(currentTrms)} className="text-xs text-cyan-400 hover:underline">Usar TRMs actuales</button>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div><label className="text-xs text-slate-400">USD/COP</label><input type="number" step="any" value={txTrms.USD} onChange={e => setTxTrms(t => ({ ...t, USD: parseFloat(e.target.value) || 0 }))} className="w-full bg-slate-950 border border-slate-700 rounded p-2" /></div>
+              <div><label className="text-xs text-slate-400">EUR/COP</label><input type="number" step="any" value={txTrms.EUR} onChange={e => setTxTrms(t => ({ ...t, EUR: parseFloat(e.target.value) || 0 }))} className="w-full bg-slate-950 border border-slate-700 rounded p-2" /></div>
+            </div>
+          </div>
+
+          <div className="bg-gradient-to-r from-indigo-950/40 to-purple-950/40 border border-indigo-700/50 rounded-lg p-3">
+            <div className="text-xs font-bold text-indigo-300 uppercase tracking-wider mb-2"><i className="fa-solid fa-eye mr-1"></i>Total operación (snapshot multi-divisa)</div>
+            <div className="grid grid-cols-3 gap-2 text-sm">
+              <div className="bg-slate-950/60 rounded p-2"><div className="text-xs text-slate-400">USD</div><div className="font-bold text-green-400">${fmt(preview.USD)}</div></div>
+              <div className="bg-slate-950/60 rounded p-2"><div className="text-xs text-slate-400">EUR</div><div className="font-bold text-blue-400">€{fmt(preview.EUR)}</div></div>
+              <div className="bg-slate-950/60 rounded p-2"><div className="text-xs text-slate-400">COP</div><div className="font-bold text-yellow-400">${fmt(preview.COP, 0)}</div></div>
+            </div>
+          </div>
+
+          <button type="submit" className="w-full bg-indigo-600 hover:bg-indigo-500 py-3 rounded-xl font-bold">Guardar</button>
+        </form>
+      </div>
+    </div>
+  );
+};
+
+/* ============================================================
+   MODAL VENTA (con FIFO real)
+   ============================================================ */
+const SellModal = ({ open, onClose, onSave, holding, currentTrms }) => {
+  const [txTrms, setTxTrms] = useState(currentTrms);
+  const [preview, setPreview] = useState({ USD: 0, EUR: 0, COP: 0 });
+  const [sharesInput, setSharesInput] = useState(0);
+  const formRef = useRef(null);
+
+  useEffect(() => {
+    if (open) {
+      setTxTrms(currentTrms);
+      setSharesInput(holding?.shares || 0);
+    }
+  }, [open, currentTrms, holding]);
+
+  const fifoPreview = useMemo(() => {
+    if (!holding || !holding.lots) return null;
+    const lots = [...holding.lots].sort((a, b) => a.purchaseDate.localeCompare(b.purchaseDate));
+    let remaining = sharesInput;
+    const consumed = [];
+    let totalCost = 0;
+    for (const lot of lots) {
+      if (remaining <= 0) break;
+      const take = Math.min(remaining, lot.shares);
+      const lotCost = take * lot.costBasis + (lot.commission || 0) * (take / lot.shares);
+      consumed.push({ lotId: lot.id, shares: take, costBasis: lot.costBasis, lotCost, purchaseDate: lot.purchaseDate });
+      totalCost += lotCost;
+      remaining -= take;
+    }
+    return { consumed, totalCost, fullySatisfied: remaining <= 0.0001 };
+  }, [sharesInput, holding]);
+
+  const recalcPreview = () => {
+    const f = formRef.current; if (!f || !holding) return;
+    const shares = parseFloat(f.shares.value) || 0;
+    const price = parseFloat(f.sellPrice.value) || 0;
+    const comm = parseFloat(f.commission.value) || 0;
+    setSharesInput(shares);
+    setPreview(snapshotMultiCurrency(shares * price - comm, holding.currency, txTrms));
+  };
+
+  useEffect(() => { recalcPreview(); /* eslint-disable-next-line */ }, [txTrms, open]);
+
+  if (!open || !holding) return null;
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (!fifoPreview?.fullySatisfied) return;
+    const f = new FormData(e.target);
+    const shares = parseFloat(f.get('shares'));
+    const sellPrice = parseFloat(f.get('sellPrice'));
+    const commission = parseFloat(f.get('commission') || 0);
+    const totalNativo = shares * sellPrice - commission;
+    const txSnapshot = snapshotMultiCurrency(totalNativo, holding.currency, txTrms);
+
+    onSave({
+      id: `s_${Date.now()}`,
+      holdingId: holding.id,
+      symbol: holding.symbol,
+      currency: holding.currency,
+      shares, sellPrice, commission,
+      date: f.get('date'),
+      notes: f.get('notes') || '',
+      txSnapshot, txTrms: { ...txTrms },
+      fifoConsumed: fifoPreview.consumed,
+      avgCostBasis: fifoPreview.totalCost / shares,
+      realizedPL_native: totalNativo - fifoPreview.totalCost
+    });
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4 animate-fade-in">
+      <div className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-xl max-h-[90vh] overflow-y-auto">
+        <div className="p-4 border-b border-slate-800 flex justify-between items-center sticky top-0 bg-slate-900 z-10">
+          <h3 className="font-bold text-red-400"><i className="fa-solid fa-arrow-trend-down mr-1"></i>Vender {holding.symbol} <span className="text-xs text-slate-400 font-normal">(FIFO)</span></h3>
+          <button onClick={onClose}><i className="fa-solid fa-xmark text-xl"></i></button>
+        </div>
+        <form ref={formRef} onSubmit={handleSubmit} onChange={recalcPreview} className="p-4 space-y-3 text-sm">
+          <div className="bg-slate-800/50 rounded p-2 text-xs">
+            Posee: <span className="font-bold text-white">{fmt(holding.shares, 4)} {holding.symbol}</span> · {holding.lots?.length || 1} lote(s)
+          </div>
+          <div className="grid grid-cols-3 gap-3">
+            <div><label className="text-xs text-slate-400">Cantidad</label><input name="shares" type="number" step="any" max={holding.shares} required defaultValue={holding.shares} className="w-full bg-slate-950 border border-slate-700 rounded p-2" /></div>
+            <div><label className="text-xs text-slate-400">Precio venta</label><input name="sellPrice" type="number" step="any" required defaultValue={holding.currentPrice} className="w-full bg-slate-950 border border-slate-700 rounded p-2" /></div>
+            <div><label className="text-xs text-slate-400">Comisión</label><input name="commission" type="number" step="any" defaultValue={0} className="w-full bg-slate-950 border border-slate-700 rounded p-2" /></div>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div><label className="text-xs text-slate-400">Fecha</label><input name="date" type="date" required defaultValue={new Date().toISOString().split('T')[0]} className="w-full bg-slate-950 border border-slate-700 rounded p-2" /></div>
+            <div><label className="text-xs text-slate-400">Notas</label><input name="notes" placeholder="rebalanceo" className="w-full bg-slate-950 border border-slate-700 rounded p-2" /></div>
+          </div>
+
+          {/* FIFO preview */}
+          {fifoPreview && fifoPreview.consumed.length > 0 && (
+            <div className="bg-cyan-950/30 border border-cyan-700/50 rounded-lg p-3">
+              <div className="text-xs font-bold text-cyan-300 uppercase tracking-wider mb-2"><i className="fa-solid fa-layer-group mr-1"></i>Lotes FIFO consumidos</div>
+              <div className="space-y-1 text-xs">
+                {fifoPreview.consumed.map((c, i) => (
+                  <div key={i} className="flex justify-between font-mono">
+                    <span className="text-slate-400">{c.purchaseDate}:</span>
+                    <span>{fmt(c.shares, 4)} × {fmtMoney(c.costBasis, holding.currency)} = {fmtMoney(c.lotCost, holding.currency)}</span>
+                  </div>
+                ))}
+                <div className="flex justify-between font-bold pt-1 border-t border-cyan-800">
+                  <span>Costo total:</span><span>{fmtMoney(fifoPreview.totalCost, holding.currency)}</span>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-3 space-y-2">
+            <div className="flex items-center justify-between">
+              <div className="text-xs font-bold text-amber-400">TRMs de la venta</div>
+              <button type="button" onClick={() => setTxTrms(currentTrms)} className="text-xs text-cyan-400 hover:underline">Actuales</button>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div><label className="text-xs text-slate-400">USD/COP</label><input type="number" step="any" value={txTrms.USD} onChange={e => setTxTrms(t => ({ ...t, USD: parseFloat(e.target.value) || 0 }))} className="w-full bg-slate-950 border border-slate-700 rounded p-2" /></div>
+              <div><label className="text-xs text-slate-400">EUR/COP</label><input type="number" step="any" value={txTrms.EUR} onChange={e => setTxTrms(t => ({ ...t, EUR: parseFloat(e.target.value) || 0 }))} className="w-full bg-slate-950 border border-slate-700 rounded p-2" /></div>
+            </div>
+          </div>
+
+          <div className="bg-gradient-to-r from-red-950/40 to-orange-950/40 border border-red-700/50 rounded-lg p-3">
+            <div className="text-xs font-bold text-red-300 uppercase tracking-wider mb-2">Ingreso neto</div>
+            <div className="grid grid-cols-3 gap-2 text-sm">
+              <div className="bg-slate-950/60 rounded p-2"><div className="text-xs text-slate-400">USD</div><div className="font-bold text-green-400">${fmt(preview.USD)}</div></div>
+              <div className="bg-slate-950/60 rounded p-2"><div className="text-xs text-slate-400">EUR</div><div className="font-bold text-blue-400">€{fmt(preview.EUR)}</div></div>
+              <div className="bg-slate-950/60 rounded p-2"><div className="text-xs text-slate-400">COP</div><div className="font-bold text-yellow-400">${fmt(preview.COP, 0)}</div></div>
+            </div>
+          </div>
+
+          <button type="submit" disabled={!fifoPreview?.fullySatisfied} className="w-full bg-red-600 hover:bg-red-500 disabled:opacity-50 py-3 rounded-xl font-bold">Ejecutar Venta FIFO</button>
+        </form>
+      </div>
+    </div>
+  );
+};
+
+/* ============================================================
+   MODAL DIVIDENDO
+   ============================================================ */
+const DividendModal = ({ open, onClose, onSave, dividendToEdit, currentTrms }) => {
+  const [txTrms, setTxTrms] = useState(currentTrms);
+  const [preview, setPreview] = useState({ USD: 0, EUR: 0, COP: 0 });
+  const formRef = useRef(null);
+
+  useEffect(() => { if (open) setTxTrms(dividendToEdit?.txTrms || currentTrms); }, [open, dividendToEdit, currentTrms]);
+
+  const recalcPreview = () => {
+    const f = formRef.current; if (!f) return;
+    const amount = parseFloat(f.amount.value) || 0;
+    const cur = f.currency.value;
+    setPreview(snapshotMultiCurrency(amount, cur, txTrms));
+  };
+
+  useEffect(() => { recalcPreview(); /* eslint-disable-next-line */ }, [txTrms, open]);
+
+  if (!open) return null;
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const amount = parseFloat(f.get('amount'));
+    const currency = f.get('currency');
+    onSave({
+      id: dividendToEdit?.id || `d_${Date.now()}`,
+      symbol: f.get('symbol').toUpperCase(),
+      amount, currency,
+      date: f.get('date'),
+      notes: f.get('notes') || '',
+      txSnapshot: snapshotMultiCurrency(amount, currency, txTrms),
+      txTrms: { ...txTrms }
+    });
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4 animate-fade-in">
+      <div className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-md max-h-[90vh] overflow-y-auto">
+        <div className="p-4 border-b border-slate-800 flex justify-between items-center">
+          <h3 className="font-bold text-amber-400"><i className="fa-solid fa-coins mr-1"></i>{dividendToEdit ? 'Editar' : 'Registrar'} Dividendo</h3>
+          <button onClick={onClose}><i className="fa-solid fa-xmark text-xl"></i></button>
+        </div>
+        <form ref={formRef} onSubmit={handleSubmit} onChange={recalcPreview} className="p-4 space-y-3 text-sm">
+          <div><label className="text-xs text-slate-400">Símbolo</label><input name="symbol" required defaultValue={dividendToEdit?.symbol} className="w-full bg-slate-950 border border-slate-700 rounded p-2" /></div>
+          <div className="grid grid-cols-2 gap-3">
+            <div><label className="text-xs text-slate-400">Monto</label><input name="amount" type="number" step="any" required defaultValue={dividendToEdit?.amount} className="w-full bg-slate-950 border border-slate-700 rounded p-2" /></div>
+            <div><label className="text-xs text-slate-400">Moneda</label><select name="currency" defaultValue={dividendToEdit?.currency || 'USD'} className="w-full bg-slate-950 border border-slate-700 rounded p-2"><option>USD</option><option>EUR</option><option>COP</option></select></div>
+          </div>
+          <div><label className="text-xs text-slate-400">Fecha</label><input name="date" type="date" required defaultValue={dividendToEdit?.date || new Date().toISOString().split('T')[0]} className="w-full bg-slate-950 border border-slate-700 rounded p-2" /></div>
+          <div><label className="text-xs text-slate-400">Notas</label><input name="notes" defaultValue={dividendToEdit?.notes || ''} className="w-full bg-slate-950 border border-slate-700 rounded p-2" /></div>
+
+          <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-3 space-y-2">
+            <div className="flex items-center justify-between">
+              <div className="text-xs font-bold text-amber-400">TRMs</div>
+              <button type="button" onClick={() => setTxTrms(currentTrms)} className="text-xs text-cyan-400 hover:underline">Actuales</button>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div><label className="text-xs text-slate-400">USD/COP</label><input type="number" step="any" value={txTrms.USD} onChange={e => setTxTrms(t => ({ ...t, USD: parseFloat(e.target.value) || 0 }))} className="w-full bg-slate-950 border border-slate-700 rounded p-2" /></div>
+              <div><label className="text-xs text-slate-400">EUR/COP</label><input type="number" step="any" value={txTrms.EUR} onChange={e => setTxTrms(t => ({ ...t, EUR: parseFloat(e.target.value) || 0 }))} className="w-full bg-slate-950 border border-slate-700 rounded p-2" /></div>
+            </div>
+          </div>
+
+          <div className="bg-gradient-to-r from-amber-950/40 to-yellow-950/40 border border-amber-700/50 rounded-lg p-3">
+            <div className="grid grid-cols-3 gap-2 text-sm">
+              <div className="bg-slate-950/60 rounded p-2"><div className="text-xs text-slate-400">USD</div><div className="font-bold text-green-400">${fmt(preview.USD)}</div></div>
+              <div className="bg-slate-950/60 rounded p-2"><div className="text-xs text-slate-400">EUR</div><div className="font-bold text-blue-400">€{fmt(preview.EUR)}</div></div>
+              <div className="bg-slate-950/60 rounded p-2"><div className="text-xs text-slate-400">COP</div><div className="font-bold text-yellow-400">${fmt(preview.COP, 0)}</div></div>
+            </div>
+          </div>
+
+          <button type="submit" className="w-full bg-amber-600 hover:bg-amber-500 py-3 rounded-xl font-bold">Guardar</button>
+        </form>
+      </div>
+    </div>
+  );
+};
+
+/* ============================================================
+   SUB-PESTAÑA: POSICIONES (con desplegables, sort, search)
+   ============================================================ */
+const PositionsSection = ({ data, setData, viewCurrency, finnhubKey, fundamentals, setFundamentals }) => {
+  const { showToast } = useToast();
+  const { hidden } = usePrivacy();
+  const [posModal, setPosModal] = useState({ open: false });
+  const [sellModal, setSellModal] = useState({ open: false });
+  const [refreshing, setRefreshing] = useState(false);
+  const [expanded, setExpanded] = useState({});
+  const [search, setSearch] = useState('');
+  const [sortBy, setSortBy] = useState('weight');
+  const [sortDir, setSortDir] = useState('desc');
+  const [filterCat, setFilterCat] = useState('all');
+  const [filterStatus, setFilterStatus] = useState('all');
+  const [groupBy, setGroupBy] = useState('none');
+  const [editingPrice, setEditingPrice] = useState(null);
+
+  const savePrice = (holdingId, newPrice) => {
+    if (!newPrice || isNaN(newPrice) || newPrice <= 0) { setEditingPrice(null); return; }
+    const next = { ...data, holdings: data.holdings.map(h => h.id === holdingId ? { ...h, currentPrice: newPrice } : h) };
+    setData(next); persistData(next);
+    setEditingPrice(null);
+    showToast('Precio actualizado para todos los lotes', 'success');
+  };
+
+  const refreshPrices = async () => {
+    if (!finnhubKey) { showToast('Falta API key', 'error'); return; }
+    setRefreshing(true);
+    const symbols = [...new Set(data.holdings.filter(h => h.type !== 'cash').map(h => h.symbol))];
+    const updates = { ...data };
+    const newFundamentals = { ...fundamentals };
+    let fundamentalsCount = 0;
+
+    for (const sym of symbols) {
+      try {
+        const q = await finnhub.quote(sym, finnhubKey);
+        if (q.c > 0) updates.holdings = updates.holdings.map(h => h.symbol === sym && h.type !== 'cash' ? { ...h, currentPrice: q.c, dayChangePct: q.dp } : h);
+        await new Promise(r => setTimeout(r, 80));
+
+        /* Fundamentales: solo si caché tiene más de 6 horas */
+        const cached = newFundamentals[sym];
+        const sixHours = 6 * 3600 * 1000;
+        if (!cached || !cached.fetchedAt || (Date.now() - cached.fetchedAt) > sixHours) {
+          try {
+            const raw = await finnhub.metric(sym, finnhubKey);
+            const normalized = normalizeMetrics(raw);
+            if (normalized) {
+              newFundamentals[sym] = normalized;
+              fundamentalsCount++;
+            }
+            await new Promise(r => setTimeout(r, 80));
+          } catch (e) { console.warn('metric fail', sym); }
+        }
+      } catch (e) { console.warn(sym); }
+    }
+    setData(updates); persistData(updates);
+    setFundamentals(newFundamentals);
+    persistFundamentals(newFundamentals);
+
+    /* Crear snapshot automático */
+    const totalValue = updates.holdings.reduce((s, h) => s + convert(h.shares * (h.currentPrice || h.costBasis), h.currency, 'USD', updates.trms), 0);
+    const snapshots = loadSnapshots();
+    const today = new Date().toISOString().split('T')[0];
+    const lastIdx = snapshots.findIndex(s => s.date === today);
+    const snap = { date: today, valueUSD: totalValue, valueEUR: convert(totalValue, 'USD', 'EUR', updates.trms), valueCOP: convert(totalValue, 'USD', 'COP', updates.trms) };
+    if (lastIdx >= 0) snapshots[lastIdx] = snap; else snapshots.push(snap);
+    persistSnapshots(snapshots);
+
+    setRefreshing(false);
+    const fmsg = fundamentalsCount > 0 ? ` · ${fundamentalsCount} fundamentales` : '';
+    showToast(`${symbols.length} precios actualizados${fmsg}`, 'success');
+  };
+
+  /* Cálculo agregado por holding */
+  const enriched = useMemo(() => {
+    const totalValueUSD = data.holdings.reduce((s, h) => s + convert(h.shares * (h.currentPrice || h.costBasis), h.currency, 'USD', data.trms), 0);
+
+    return data.holdings.map(h => {
+      const lots = h.lots || [{ shares: h.shares, costBasis: h.costBasis, commission: h.commission || 0, purchaseDate: h.purchaseDate, txSnapshot: h.txSnapshot, txTrms: h.txTrms }];
+      const totalShares = lots.reduce((s, l) => s + l.shares, 0);
+      const totalCostNative = lots.reduce((s, l) => s + l.shares * l.costBasis + (l.commission || 0), 0);
+      const avgCost = totalShares > 0 ? (totalCostNative - lots.reduce((s, l) => s + (l.commission || 0), 0)) / totalShares : 0;
+      const valueNative = totalShares * (h.currentPrice || avgCost);
+      const plNative = valueNative - totalCostNative;
+      const plPct = totalCostNative ? (plNative / totalCostNative) * 100 : 0;
+      const valueUSD = convert(valueNative, h.currency, 'USD', data.trms);
+      const valueView = convert(valueNative, h.currency, viewCurrency, data.trms);
+      const costView = convert(totalCostNative, h.currency, viewCurrency, data.trms);
+      const plView = valueView - costView;
+      const weight = totalValueUSD > 0 ? valueUSD / totalValueUSD : 0;
+
+      /* CAGR ponderado por lote */
+      const oldestLot = lots.reduce((min, l) => !min || l.purchaseDate < min.purchaseDate ? l : min, null);
+      const days = oldestLot ? daysBetween(oldestLot.purchaseDate, new Date()) : 0;
+      const cagr = calcCAGR(totalCostNative, valueNative, days);
+
+      /* P/L realizado del activo */
+      const sales = (data.sales || []).filter(s => s.holdingId === h.id || s.symbol === h.symbol);
+      const realizedPL = sales.reduce((s, sale) => s + (sale.realizedPL_native || 0), 0);
+
+      /* Dividendos cobrados (en moneda nativa de la posición) */
+      const divs = (data.dividends || []).filter(d => d.symbol === h.symbol);
+      const divTotal = divs.reduce((s, d) => s + convert(d.amount, d.currency, h.currency, data.trms), 0);
+      const yoc = totalCostNative > 0 ? (divTotal / totalCostNative) * 100 : 0;
+
+      /* Fundamentales para este símbolo (si están cacheados) */
+      const fundamental = fundamentals[h.symbol] || null;
+      const per = fundamental?.per ?? null;
+
+      return {
+        ...h, lots, totalShares, totalCostNative, avgCost, valueNative, plNative, plPct,
+        valueView, costView, plView, weight, cagr, daysHeld: days,
+        realizedPL, divTotal, yoc,
+        fundamental, per,
+        oldestDate: oldestLot?.purchaseDate
+      };
+    });
+  }, [data, viewCurrency, fundamentals]);
+
+  const filtered = useMemo(() => {
+    let list = enriched.filter(h => {
+      if (search && !h.symbol.toLowerCase().includes(search.toLowerCase()) && !(h.category || '').toLowerCase().includes(search.toLowerCase())) return false;
+      if (filterCat !== 'all' && h.category !== filterCat) return false;
+      if (filterStatus === 'winners' && h.plPct < 0) return false;
+      if (filterStatus === 'losers' && h.plPct >= 0) return false;
+      return true;
+    });
+
+    const sorter = (a, b) => {
+      let av, bv;
+      if (sortBy === 'symbol') { av = a.symbol; bv = b.symbol; }
+      else if (sortBy === 'weight') { av = a.weight; bv = b.weight; }
+      else if (sortBy === 'shares') { av = a.totalShares; bv = b.totalShares; }
+      else if (sortBy === 'cost') { av = a.costView; bv = b.costView; }
+      else if (sortBy === 'value') { av = a.valueView; bv = b.valueView; }
+      else if (sortBy === 'pl') { av = a.plView; bv = b.plView; }
+      else if (sortBy === 'plPct') { av = a.plPct; bv = b.plPct; }
+      else if (sortBy === 'cagr') { av = a.cagr || -999; bv = b.cagr || -999; }
+      else if (sortBy === 'per') { av = a.per ?? 999; bv = b.per ?? 999; }
+      else if (sortBy === 'category') { av = a.category || ''; bv = b.category || ''; }
+      else return 0;
+      if (typeof av === 'string') return sortDir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
+      return sortDir === 'asc' ? av - bv : bv - av;
+    };
+    return list.sort(sorter);
+  }, [enriched, search, sortBy, sortDir, filterCat, filterStatus]);
+
+  /* Agrupamiento por categoría (para vista groupBy='category') */
+  const grouped = useMemo(() => {
+    if (groupBy === 'none') return null;
+    const groups = {};
+    filtered.forEach(h => {
+      const k = h.category || 'Otros';
+      if (!groups[k]) groups[k] = { items: [], totalValue: 0, totalCost: 0, totalPL: 0 };
+      groups[k].items.push(h);
+      groups[k].totalValue += h.valueView;
+      groups[k].totalCost += h.costView;
+      groups[k].totalPL += h.plView;
+    });
+    return groups;
+  }, [filtered, groupBy]);
+
+  const categories = useMemo(() => [...new Set(enriched.map(h => h.category).filter(Boolean))], [enriched]);
+
+  const SortHeader = ({ field, label, align = 'left', className = '' }) => {
+    const active = sortBy === field;
+    return (
+      <th className={`p-1.5 md:p-2 cursor-pointer hover:text-cyan-400 select-none text-${align} text-xs ${className}`} onClick={() => {
+        if (active) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+        else { setSortBy(field); setSortDir('desc'); }
+      }}>
+        {label} {active && <i className={`fa-solid ${sortDir === 'asc' ? 'fa-caret-up' : 'fa-caret-down'} ml-1`}></i>}
+      </th>
+    );
+  };
+
+  const handleSavePosition = (payload) => {
+    let nextHoldings;
+    if (payload.mode === 'newPosition') {
+      /* Añadir y luego consolidar todo (idempotente, fusiona duplicados case-insensitive) */
+      const normalized = { ...payload.holding, symbol: (payload.holding.symbol || '').trim().toUpperCase() };
+      nextHoldings = consolidateHoldings([...data.holdings, normalized]);
+      const wasConsolidated = nextHoldings.length === data.holdings.length;
+      showToast(wasConsolidated ? `Lote añadido a ${normalized.symbol} (consolidado)` : 'Posición creada', 'success');
+    } else if (payload.mode === 'addLot') {
+      nextHoldings = data.holdings.map(h => {
+        if (h.id !== payload.holdingId) return h;
+        const newLots = [...(h.lots || []), payload.lot].sort((a, b) => (a.purchaseDate || '').localeCompare(b.purchaseDate || ''));
+        const newShares = newLots.reduce((s, l) => s + l.shares, 0);
+        return { ...h, lots: newLots, shares: newShares, currentPrice: payload.currentPrice || h.currentPrice };
+      });
+      showToast('Lote añadido', 'success');
+    } else if (payload.mode === 'editLot') {
+      nextHoldings = data.holdings.map(h => {
+        if (h.id !== payload.holdingId) return h;
+        const newLots = h.lots.map(l => l.id === payload.lot.id ? payload.lot : l).sort((a, b) => (a.purchaseDate || '').localeCompare(b.purchaseDate || ''));
+        const newShares = newLots.reduce((s, l) => s + l.shares, 0);
+        return { ...h, lots: newLots, shares: newShares };
+      });
+      showToast('Lote actualizado', 'success');
+    }
+    const next = { ...data, holdings: nextHoldings };
+    setData(next); persistData(next); setPosModal({ open: false });
+  };
+
+  const handleSaveSale = (sale) => {
+    const h = data.holdings.find(x => x.id === sale.holdingId);
+    if (!h) return;
+    /* Consumir lotes FIFO */
+    const consumed = sale.fifoConsumed;
+    const newLots = h.lots.map(lot => {
+      const used = consumed.find(c => c.lotId === lot.id);
+      if (!used) return lot;
+      const remaining = lot.shares - used.shares;
+      if (remaining < 0.0001) return null;
+      return { ...lot, shares: remaining };
+    }).filter(Boolean);
+
+    const newShares = newLots.reduce((s, l) => s + l.shares, 0);
+    let nextHoldings;
+    if (newShares < 0.0001) {
+      nextHoldings = data.holdings.filter(x => x.id !== h.id);
+    } else {
+      nextHoldings = data.holdings.map(x => x.id === h.id ? { ...x, lots: newLots, shares: newShares } : x);
+    }
+    const next = { ...data, holdings: nextHoldings, sales: [...(data.sales || []), sale] };
+    setData(next); persistData(next); setSellModal({ open: false });
+    showToast('Venta registrada (FIFO)', 'success');
+  };
+
+  const deleteLot = (holdingId, lotId) => {
+    if (!confirm('¿Eliminar este lote? Si es el único, se eliminará la posición.')) return;
+    const next = { ...data, holdings: data.holdings.map(h => {
+      if (h.id !== holdingId) return h;
+      const newLots = h.lots.filter(l => l.id !== lotId);
+      const newShares = newLots.reduce((s, l) => s + l.shares, 0);
+      return { ...h, lots: newLots, shares: newShares };
+    }).filter(h => (h.lots && h.lots.length > 0) || h.type === 'cash')};
+    setData(next); persistData(next);
+    showToast('Lote eliminado', 'success');
+  };
+
+  const renderRow = (h) => {
+    const isExpanded = expanded[h.id];
+    return (
+      <React.Fragment key={h.id}>
+        <tr className="border-t border-slate-800 hover:bg-slate-800/30 cursor-pointer" onClick={() => setExpanded(e => ({ ...e, [h.id]: !e[h.id] }))}>
+          <td className="p-1.5 md:p-2 w-6 text-center">
+            <i className={`fa-solid ${isExpanded ? 'fa-chevron-down' : 'fa-chevron-right'} text-slate-400 text-[0.65rem]`}></i>
+          </td>
+          <td className="p-1.5 md:p-2 font-bold">
+            <div className="flex items-center gap-1.5">
+              <span>{h.symbol}</span>
+              {h.lots && h.lots.length > 1 && (
+                <span className="bg-cyan-900/60 border border-cyan-700/50 text-cyan-300 text-[10px] font-mono px-1 py-0.5 rounded">×{h.lots.length}</span>
+              )}
+            </div>
+          </td>
+          <td className="text-right p-1.5 md:p-2 font-mono">
+            <span className={h.weight > 0.15 ? 'text-cyan-400 font-bold' : 'text-slate-300'}>{hidden ? '••%' : `${(h.weight * 100).toFixed(1)}%`}</span>
+          </td>
+          <td className="text-right p-1.5 md:p-2 font-mono hidden md:table-cell">{fmt(h.totalShares, 4)}</td>
+          <td className="text-right p-1.5 md:p-2 font-mono hidden lg:table-cell">{fmtMoney(h.avgCost, h.currency)}</td>
+          <td className="text-right p-1.5 md:p-2 font-mono hidden md:table-cell" onClick={e => e.stopPropagation()}>
+            {editingPrice === h.id ? (
+              <input
+                type="number" step="any" autoFocus defaultValue={h.currentPrice}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') savePrice(h.id, parseFloat(e.target.value));
+                  if (e.key === 'Escape') setEditingPrice(null);
+                }}
+                onBlur={e => savePrice(h.id, parseFloat(e.target.value))}
+                className="w-20 bg-slate-950 border border-cyan-600 rounded px-1 py-0.5 text-right text-white"
+              />
+            ) : (
+              <span onClick={() => setEditingPrice(h.id)} className="cursor-pointer hover:text-cyan-400 group inline-flex items-center gap-1">
+                {fmtMoney(h.currentPrice, h.currency)}
+                <i className="fa-solid fa-pen-to-square text-[0.6rem] text-slate-600 group-hover:text-cyan-400"></i>
+              </span>
+            )}
+          </td>
+          <td className="text-right p-1.5 md:p-2 font-mono">{fmtMoney(h.valueView, viewCurrency)}</td>
+          <td className={`text-right p-1.5 md:p-2 font-mono hidden sm:table-cell ${h.plView >= 0 ? 'text-green-400' : 'text-red-400'}`}>{fmtMoney(h.plView, viewCurrency)}</td>
+          <td className={`text-right p-1.5 md:p-2 font-mono ${h.plPct >= 0 ? 'text-green-400' : 'text-red-400'}`}>{fmtPct(h.plPct)}</td>
+          <td className={`text-right p-1.5 md:p-2 font-mono hidden lg:table-cell ${(h.cagr || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{h.cagr !== null ? fmtPct(h.cagr) : '—'}</td>
+          <td className="text-right p-1.5 md:p-2 font-mono hidden md:table-cell">
+            {h.per !== null ? (
+              <span className={`px-1.5 py-0.5 rounded border text-xs ${scoreColor(scoreRatio('per', h.per))}`} title={`PER ${h.per.toFixed(2)}`}>
+                {h.per.toFixed(1)}
+              </span>
+            ) : <span className="text-slate-600 text-xs">—</span>}
+          </td>
+          <td className="text-center p-1.5 md:p-2 text-slate-400 hidden lg:table-cell">{h.category || '—'}</td>
+          <td className="p-1.5 md:p-2 text-right whitespace-nowrap" onClick={e => e.stopPropagation()}>
+            <button onClick={() => setPosModal({ open: true, mode: 'addLot', holdingToEdit: h })} className="text-indigo-400 hover:text-indigo-300 mr-1 md:mr-2" title="Añadir compra"><i className="fa-solid fa-plus text-xs"></i></button>
+            {h.type !== 'cash' && <button onClick={() => setSellModal({ open: true, holding: h })} className="text-red-400 hover:text-red-300" title="Vender FIFO"><i className="fa-solid fa-arrow-trend-down text-xs"></i></button>}
+          </td>
+        </tr>
+        {isExpanded && (
+          <tr className="bg-slate-950/50">
+            <td colSpan="12" className="p-3 border-t border-slate-800">
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-3">
+                <div className="bg-slate-900 rounded p-2">
+                  <div className="text-xs text-slate-400">Días en cartera</div>
+                  <div className="font-bold text-sm">{h.daysHeld} d</div>
+                </div>
+                <div className="bg-slate-900 rounded p-2">
+                  <div className="text-xs text-slate-400">CAGR</div>
+                  <div className={`font-bold text-sm ${(h.cagr || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{h.cagr !== null ? fmtPct(h.cagr) : '—'}</div>
+                </div>
+                <div className="bg-slate-900 rounded p-2">
+                  <div className="text-xs text-slate-400">P/L Realizado</div>
+                  <div className={`font-bold text-sm ${h.realizedPL >= 0 ? 'text-green-400' : 'text-red-400'}`}>{fmtMoney(h.realizedPL, h.currency)}</div>
+                </div>
+                <div className="bg-slate-900 rounded p-2">
+                  <div className="text-xs text-slate-400">Dividendos</div>
+                  <div className="font-bold text-sm text-amber-400">{fmtMoney(h.divTotal, h.currency)}</div>
+                </div>
+                <div className="bg-slate-900 rounded p-2">
+                  <div className="text-xs text-slate-400">YoC</div>
+                  <div className="font-bold text-sm text-amber-400">{fmtPct(h.yoc)}</div>
+                </div>
+              </div>
+              <div className="flex items-center justify-between mb-2">
+                <div className="text-xs text-slate-400 uppercase tracking-wider"><i className="fa-solid fa-layer-group mr-1 text-cyan-400"></i>{h.lots.length} {h.lots.length === 1 ? 'compra' : 'compras'} consolidadas — orden FIFO</div>
+                {h.lots.length > 1 && <div className="text-xs text-slate-500">Costo medio ponderado: <span className="font-mono text-slate-300">{fmtMoney(h.avgCost, h.currency)}</span></div>}
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead className="text-slate-500">
+                    <tr>
+                      <th className="text-left p-1">Fecha</th>
+                      <th className="text-right p-1">Cant.</th>
+                      <th className="text-right p-1">Costo unit.</th>
+                      <th className="text-right p-1">Comisión</th>
+                      <th className="text-right p-1">Total nativo</th>
+                      <th className="text-right p-1">USD</th>
+                      <th className="text-right p-1">EUR</th>
+                      <th className="text-right p-1">COP</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {h.lots.map(lot => (
+                      <tr key={lot.id} className="border-t border-slate-800">
+                        <td className="p-1">{lot.purchaseDate}</td>
+                        <td className="text-right p-1 font-mono">{fmt(lot.shares, 4)}</td>
+                        <td className="text-right p-1 font-mono">{fmtMoney(lot.costBasis, h.currency)}</td>
+                        <td className="text-right p-1 font-mono">{fmtMoney(lot.commission || 0, h.currency)}</td>
+                        <td className="text-right p-1 font-mono">{fmtMoney(lot.shares * lot.costBasis + (lot.commission || 0), h.currency)}</td>
+                        <td className="text-right p-1 font-mono text-green-400">${fmt(lot.txSnapshot?.USD || 0)}</td>
+                        <td className="text-right p-1 font-mono text-blue-400">€{fmt(lot.txSnapshot?.EUR || 0)}</td>
+                        <td className="text-right p-1 font-mono text-yellow-400">${fmt(lot.txSnapshot?.COP || 0, 0)}</td>
+                        <td className="p-1 text-right whitespace-nowrap">
+                          <button onClick={() => setPosModal({ open: true, mode: 'editLot', holdingToEdit: h, lotToEdit: lot })} className="text-slate-400 hover:text-white mr-1"><i className="fa-solid fa-pen text-xs"></i></button>
+                          <button onClick={() => deleteLot(h.id, lot.id)} className="text-slate-400 hover:text-red-400"><i className="fa-solid fa-trash text-xs"></i></button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {/* Fundamentales */}
+              {h.type !== 'cash' && (
+                <div className="mt-4 pt-3 border-t border-slate-800">
+                  <FundamentalsGrid metrics={h.fundamental} currentPrice={h.currentPrice} />
+                </div>
+              )}
+              {h.notes && <div className="text-xs text-slate-400 mt-2"><i className="fa-solid fa-note-sticky mr-1"></i>{h.notes}</div>}
+            </td>
+          </tr>
+        )}
+      </React.Fragment>
+    );
+  };
+
+  return (
+    <div className="space-y-3">
+      {/* Toolbar */}
+      <div className="flex flex-wrap gap-2 items-center">
+        <div className="flex-1 min-w-[200px] relative">
+          <i className="fa-solid fa-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 text-xs"></i>
+          <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Buscar símbolo o categoría..." className="w-full bg-slate-900 border border-slate-700 rounded pl-8 pr-3 py-1.5 text-sm" />
+        </div>
+        <select value={filterCat} onChange={e => setFilterCat(e.target.value)} className="bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-sm">
+          <option value="all">Todas las cat.</option>
+          {categories.map(c => <option key={c}>{c}</option>)}
+        </select>
+        <select value={filterStatus} onChange={e => setFilterStatus(e.target.value)} className="bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-sm">
+          <option value="all">Todas</option>
+          <option value="winners">Ganadoras</option>
+          <option value="losers">Perdedoras</option>
+        </select>
+        <select value={groupBy} onChange={e => setGroupBy(e.target.value)} className="bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-sm">
+          <option value="none">Sin agrupar</option>
+          <option value="category">Agrupar por categoría</option>
+        </select>
+        <button onClick={refreshPrices} disabled={refreshing} className="bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 px-3 py-1.5 rounded text-sm">
+          <i className={`fa-solid fa-rotate ${refreshing ? 'fa-spin' : ''} mr-1`}></i>Actualizar
+        </button>
+        <button onClick={() => setPosModal({ open: true, mode: 'newPosition' })} className="bg-indigo-600 hover:bg-indigo-500 px-3 py-1.5 rounded text-sm">
+          <i className="fa-solid fa-plus mr-1"></i>Nueva
+        </button>
+      </div>
+
+      {/* Tabla responsive: en móvil solo lo esencial */}
+      <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs md:text-sm">
+            <thead className="sticky-th">
+              <tr className="text-slate-400">
+                <th className="w-6"></th>
+                <SortHeader field="symbol" label="Símbolo" />
+                <SortHeader field="weight" label="%" align="right" />
+                <SortHeader field="shares" label="Cant." align="right" className="hidden md:table-cell" />
+                <SortHeader field="cost" label="Costo" align="right" className="hidden lg:table-cell" />
+                <th className="text-right p-1.5 md:p-2 text-xs hidden md:table-cell">Actual</th>
+                <SortHeader field="value" label={`Valor`} align="right" />
+                <SortHeader field="pl" label={`P/L`} align="right" className="hidden sm:table-cell" />
+                <SortHeader field="plPct" label="%" align="right" />
+                <SortHeader field="cagr" label="CAGR" align="right" className="hidden lg:table-cell" />
+                <SortHeader field="per" label="PER" align="right" className="hidden md:table-cell" />
+                <SortHeader field="category" label="Cat." align="center" className="hidden lg:table-cell" />
+                <th className="text-right p-1.5 md:p-2 text-xs">·</th>
+              </tr>
+            </thead>
+            <tbody>
+              {!grouped && filtered.map(renderRow)}
+              {grouped && Object.entries(grouped).map(([cat, g]) => (
+                <React.Fragment key={cat}>
+                  <tr className="bg-slate-800/70">
+                    <td colSpan="12" className="p-2 font-bold text-cyan-400 text-sm">
+                      <i className="fa-solid fa-folder mr-2"></i>{cat} <span className="text-xs text-slate-400 font-normal">({g.items.length}) · Valor: {fmtMoney(g.totalValue, viewCurrency)} · P/L: <span className={g.totalPL >= 0 ? 'text-green-400' : 'text-red-400'}>{fmtMoney(g.totalPL, viewCurrency)}</span></span>
+                    </td>
+                  </tr>
+                  {g.items.map(renderRow)}
+                </React.Fragment>
+              ))}
+              {filtered.length === 0 && (
+                <tr><td colSpan="12" className="p-8 text-center text-slate-500 text-sm">
+                  {data.holdings.length === 0 ? 'Sin posiciones. Pulsa "Nueva".' : 'Sin resultados con estos filtros.'}
+                </td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <PositionModal open={posModal.open} onClose={() => setPosModal({ open: false })} onSave={handleSavePosition} mode={posModal.mode} holdingToEdit={posModal.holdingToEdit} lotToEdit={posModal.lotToEdit} currentTrms={data.trms} />
+      <SellModal open={sellModal.open} onClose={() => setSellModal({ open: false })} onSave={handleSaveSale} holding={sellModal.holding} currentTrms={data.trms} />
+    </div>
+  );
+};
+
+/* ============================================================
+   SUB-PESTAÑA: VENTAS
+   ============================================================ */
+const SalesSection = ({ data, setData, viewCurrency }) => {
+  const { showToast } = useToast();
+  const [search, setSearch] = useState('');
+  const [sortBy, setSortBy] = useState('date');
+  const [sortDir, setSortDir] = useState('desc');
+  const [yearFilter, setYearFilter] = useState('all');
+  const [expanded, setExpanded] = useState({});
+
+  const sales = data.sales || [];
+  const years = useMemo(() => [...new Set(sales.map(s => s.date?.slice(0, 4)).filter(Boolean))].sort().reverse(), [sales]);
+
+  const enriched = useMemo(() => sales.map(s => ({
+    ...s,
+    valueView: convert(s.shares * s.sellPrice - (s.commission || 0), s.currency, viewCurrency, data.trms),
+    plView: convert(s.realizedPL_native || 0, s.currency, viewCurrency, data.trms)
+  })), [sales, viewCurrency, data.trms]);
+
+  const filtered = useMemo(() => {
+    let list = enriched.filter(s => {
+      if (search && !s.symbol.toLowerCase().includes(search.toLowerCase())) return false;
+      if (yearFilter !== 'all' && !s.date?.startsWith(yearFilter)) return false;
+      return true;
+    });
+    list.sort((a, b) => {
+      let av, bv;
+      if (sortBy === 'date') { av = a.date; bv = b.date; }
+      else if (sortBy === 'symbol') { av = a.symbol; bv = b.symbol; }
+      else if (sortBy === 'value') { av = a.valueView; bv = b.valueView; }
+      else if (sortBy === 'pl') { av = a.plView; bv = b.plView; }
+      if (typeof av === 'string') return sortDir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
+      return sortDir === 'asc' ? av - bv : bv - av;
+    });
+    return list;
+  }, [enriched, search, sortBy, sortDir, yearFilter]);
+
+  const totals = useMemo(() => ({
+    count: filtered.length,
+    ingresos: filtered.reduce((s, x) => s + x.valueView, 0),
+    plTotal: filtered.reduce((s, x) => s + x.plView, 0),
+    ganadoras: filtered.filter(x => x.plView > 0).length,
+    perdedoras: filtered.filter(x => x.plView < 0).length
+  }), [filtered]);
+
+  const deleteSale = (id) => {
+    if (!confirm('¿Eliminar venta? Esto NO restaura los lotes consumidos.')) return;
+    const next = { ...data, sales: data.sales.filter(s => s.id !== id) };
+    setData(next); persistData(next);
+    showToast('Venta eliminada', 'success');
+  };
+
+  const SortHeader = ({ field, label, align = 'left' }) => {
+    const active = sortBy === field;
+    return (
+      <th className={`p-2 cursor-pointer hover:text-cyan-400 select-none text-${align} text-xs`} onClick={() => {
+        if (active) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+        else { setSortBy(field); setSortDir('desc'); }
+      }}>{label} {active && <i className={`fa-solid ${sortDir === 'asc' ? 'fa-caret-up' : 'fa-caret-down'} ml-1`}></i>}</th>
+    );
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
+        <div className="bg-slate-900 border border-slate-800 rounded p-3"><div className="text-xs text-slate-400">Ventas</div><div className="text-lg font-bold">{totals.count}</div></div>
+        <div className="bg-slate-900 border border-slate-800 rounded p-3"><div className="text-xs text-slate-400">Ingresos</div><div className="text-lg font-bold">{fmtMoney(totals.ingresos, viewCurrency)}</div></div>
+        <div className="bg-slate-900 border border-slate-800 rounded p-3"><div className="text-xs text-slate-400">P/L Realizado</div><div className={`text-lg font-bold ${totals.plTotal >= 0 ? 'text-green-400' : 'text-red-400'}`}>{fmtMoney(totals.plTotal, viewCurrency)}</div></div>
+        <div className="bg-slate-900 border border-slate-800 rounded p-3"><div className="text-xs text-slate-400">Ganadoras</div><div className="text-lg font-bold text-green-400">{totals.ganadoras}</div></div>
+        <div className="bg-slate-900 border border-slate-800 rounded p-3"><div className="text-xs text-slate-400">Perdedoras</div><div className="text-lg font-bold text-red-400">{totals.perdedoras}</div></div>
+      </div>
+
+      <div className="flex flex-wrap gap-2 items-center">
+        <div className="flex-1 min-w-[200px] relative">
+          <i className="fa-solid fa-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 text-xs"></i>
+          <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Buscar símbolo..." className="w-full bg-slate-900 border border-slate-700 rounded pl-8 pr-3 py-1.5 text-sm" />
+        </div>
+        <select value={yearFilter} onChange={e => setYearFilter(e.target.value)} className="bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-sm">
+          <option value="all">Todos los años</option>
+          {years.map(y => <option key={y}>{y}</option>)}
+        </select>
+        <button onClick={() => exportLedgerCSV(data, 'sales')} className="bg-purple-600 hover:bg-purple-500 px-3 py-1.5 rounded text-sm">
+          <i className="fa-solid fa-file-csv mr-1"></i>Exportar CSV
+        </button>
+      </div>
+
+      <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead className="sticky-th">
+            <tr className="text-slate-400">
+              <th className="w-8"></th>
+              <SortHeader field="date" label="Fecha" />
+              <SortHeader field="symbol" label="Símbolo" />
+              <th className="text-right p-2 text-xs">Cant.</th>
+              <th className="text-right p-2 text-xs">Precio</th>
+              <SortHeader field="value" label={`Ingreso (${viewCurrency})`} align="right" />
+              <SortHeader field="pl" label={`P/L (${viewCurrency})`} align="right" />
+              <th className="text-right p-2 text-xs">USD</th>
+              <th className="text-right p-2 text-xs">EUR</th>
+              <th className="text-right p-2 text-xs">COP</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map(s => (
+              <React.Fragment key={s.id}>
+                <tr className="border-t border-slate-800 hover:bg-slate-800/30 cursor-pointer" onClick={() => setExpanded(e => ({ ...e, [s.id]: !e[s.id] }))}>
+                  <td className="p-2 w-8 text-center"><i className={`fa-solid ${expanded[s.id] ? 'fa-chevron-down' : 'fa-chevron-right'} text-slate-400 text-xs`}></i></td>
+                  <td className="p-2">{s.date}</td>
+                  <td className="p-2 font-bold">{s.symbol}</td>
+                  <td className="text-right p-2 font-mono text-xs">{fmt(s.shares, 4)}</td>
+                  <td className="text-right p-2 font-mono text-xs">{fmtMoney(s.sellPrice, s.currency)}</td>
+                  <td className="text-right p-2 font-mono">{fmtMoney(s.valueView, viewCurrency)}</td>
+                  <td className={`text-right p-2 font-mono ${s.plView >= 0 ? 'text-green-400' : 'text-red-400'}`}>{fmtMoney(s.plView, viewCurrency)}</td>
+                  <td className="text-right p-2 font-mono text-xs text-green-400">${fmt(s.txSnapshot?.USD || 0)}</td>
+                  <td className="text-right p-2 font-mono text-xs text-blue-400">€{fmt(s.txSnapshot?.EUR || 0)}</td>
+                  <td className="text-right p-2 font-mono text-xs text-yellow-400">${fmt(s.txSnapshot?.COP || 0, 0)}</td>
+                  <td className="p-2 text-right" onClick={e => e.stopPropagation()}>
+                    <button onClick={() => deleteSale(s.id)} className="text-slate-400 hover:text-red-400"><i className="fa-solid fa-trash text-xs"></i></button>
+                  </td>
+                </tr>
+                {expanded[s.id] && (
+                  <tr className="bg-slate-950/50">
+                    <td colSpan="11" className="p-3 border-t border-slate-800">
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-2 text-xs">
+                        <div><span className="text-slate-400">Costo medio FIFO:</span> <span className="font-mono">{fmtMoney(s.avgCostBasis, s.currency)}</span></div>
+                        <div><span className="text-slate-400">Comisión:</span> <span className="font-mono">{fmtMoney(s.commission, s.currency)}</span></div>
+                        <div><span className="text-slate-400">TRM USD/COP:</span> <span className="font-mono">{fmt(s.txTrms?.USD || 0, 2)}</span></div>
+                        <div><span className="text-slate-400">TRM EUR/COP:</span> <span className="font-mono">{fmt(s.txTrms?.EUR || 0, 2)}</span></div>
+                      </div>
+                      {s.fifoConsumed && s.fifoConsumed.length > 0 && (
+                        <div>
+                          <div className="text-xs text-slate-400 mb-1 uppercase tracking-wider">Lotes consumidos (FIFO)</div>
+                          <table className="w-full text-xs">
+                            <thead className="text-slate-500"><tr><th className="text-left p-1">Lote (fecha)</th><th className="text-right p-1">Cant.</th><th className="text-right p-1">Costo unit.</th><th className="text-right p-1">Costo total</th></tr></thead>
+                            <tbody>
+                              {s.fifoConsumed.map((c, i) => (
+                                <tr key={i} className="border-t border-slate-800">
+                                  <td className="p-1">{c.purchaseDate}</td>
+                                  <td className="text-right p-1 font-mono">{fmt(c.shares, 4)}</td>
+                                  <td className="text-right p-1 font-mono">{fmtMoney(c.costBasis, s.currency)}</td>
+                                  <td className="text-right p-1 font-mono">{fmtMoney(c.lotCost, s.currency)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                      {s.notes && <div className="text-xs text-slate-400 mt-2"><i className="fa-solid fa-note-sticky mr-1"></i>{s.notes}</div>}
+                    </td>
+                  </tr>
+                )}
+              </React.Fragment>
+            ))}
+            {filtered.length === 0 && <tr><td colSpan="11" className="p-8 text-center text-slate-500 text-sm">{sales.length === 0 ? 'Sin ventas registradas.' : 'Sin resultados.'}</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+};
+
+/* ============================================================
+   SUB-PESTAÑA: DIVIDENDOS
+   ============================================================ */
+const DividendsSection = ({ data, setData, viewCurrency }) => {
+  const { showToast } = useToast();
+  const [modal, setModal] = useState({ open: false });
+  const [search, setSearch] = useState('');
+  const [sortBy, setSortBy] = useState('date');
+  const [sortDir, setSortDir] = useState('desc');
+  const [yearFilter, setYearFilter] = useState('all');
+
+  const divs = data.dividends || [];
+  const years = useMemo(() => [...new Set(divs.map(d => d.date?.slice(0, 4)).filter(Boolean))].sort().reverse(), [divs]);
+
+  const enriched = useMemo(() => divs.map(d => ({
+    ...d,
+    valueView: convert(d.amount, d.currency, viewCurrency, data.trms)
+  })), [divs, viewCurrency, data.trms]);
+
+  const filtered = useMemo(() => {
+    let list = enriched.filter(d => {
+      if (search && !d.symbol.toLowerCase().includes(search.toLowerCase())) return false;
+      if (yearFilter !== 'all' && !d.date?.startsWith(yearFilter)) return false;
+      return true;
+    });
+    list.sort((a, b) => {
+      let av, bv;
+      if (sortBy === 'date') { av = a.date; bv = b.date; }
+      else if (sortBy === 'symbol') { av = a.symbol; bv = b.symbol; }
+      else if (sortBy === 'amount') { av = a.valueView; bv = b.valueView; }
+      if (typeof av === 'string') return sortDir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
+      return sortDir === 'asc' ? av - bv : bv - av;
+    });
+    return list;
+  }, [enriched, search, sortBy, sortDir, yearFilter]);
+
+  const handleSave = (div) => {
+    const next = { ...data, dividends: modal.dividendToEdit ? data.dividends.map(d => d.id === div.id ? div : d) : [...(data.dividends || []), div] };
+    setData(next); persistData(next);
+    setModal({ open: false });
+    showToast('Dividendo guardado', 'success');
+  };
+
+  const deleteDiv = (id) => {
+    if (!confirm('¿Eliminar dividendo?')) return;
+    const next = { ...data, dividends: data.dividends.filter(d => d.id !== id) };
+    setData(next); persistData(next);
+  };
+
+  const totals = useMemo(() => ({
+    count: filtered.length,
+    total: filtered.reduce((s, x) => s + x.valueView, 0)
+  }), [filtered]);
+
+  const SortHeader = ({ field, label, align = 'left' }) => {
+    const active = sortBy === field;
+    return (
+      <th className={`p-2 cursor-pointer hover:text-cyan-400 select-none text-${align} text-xs`} onClick={() => {
+        if (active) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+        else { setSortBy(field); setSortDir('desc'); }
+      }}>{label} {active && <i className={`fa-solid ${sortDir === 'asc' ? 'fa-caret-up' : 'fa-caret-down'} ml-1`}></i>}</th>
+    );
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="grid grid-cols-2 gap-2">
+        <div className="bg-slate-900 border border-slate-800 rounded p-3"><div className="text-xs text-slate-400">Total registros</div><div className="text-lg font-bold">{totals.count}</div></div>
+        <div className="bg-slate-900 border border-slate-800 rounded p-3"><div className="text-xs text-slate-400">Total cobrado ({viewCurrency})</div><div className="text-lg font-bold text-amber-400">{fmtMoney(totals.total, viewCurrency)}</div></div>
+      </div>
+
+      <div className="flex flex-wrap gap-2 items-center">
+        <div className="flex-1 min-w-[200px] relative">
+          <i className="fa-solid fa-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 text-xs"></i>
+          <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Buscar símbolo..." className="w-full bg-slate-900 border border-slate-700 rounded pl-8 pr-3 py-1.5 text-sm" />
+        </div>
+        <select value={yearFilter} onChange={e => setYearFilter(e.target.value)} className="bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-sm">
+          <option value="all">Todos los años</option>
+          {years.map(y => <option key={y}>{y}</option>)}
+        </select>
+        <button onClick={() => exportLedgerCSV(data, 'dividends')} className="bg-purple-600 hover:bg-purple-500 px-3 py-1.5 rounded text-sm">
+          <i className="fa-solid fa-file-csv mr-1"></i>Exportar CSV
+        </button>
+        <button onClick={() => setModal({ open: true })} className="bg-amber-600 hover:bg-amber-500 px-3 py-1.5 rounded text-sm">
+          <i className="fa-solid fa-plus mr-1"></i>Nuevo
+        </button>
+      </div>
+
+      <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead className="sticky-th">
+            <tr className="text-slate-400">
+              <SortHeader field="date" label="Fecha" />
+              <SortHeader field="symbol" label="Símbolo" />
+              <th className="text-right p-2 text-xs">Monto nativo</th>
+              <th className="text-center p-2 text-xs">Mon.</th>
+              <SortHeader field="amount" label={`Total (${viewCurrency})`} align="right" />
+              <th className="text-right p-2 text-xs">USD</th>
+              <th className="text-right p-2 text-xs">EUR</th>
+              <th className="text-right p-2 text-xs">COP</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map(d => (
+              <tr key={d.id} className="border-t border-slate-800 hover:bg-slate-800/30">
+                <td className="p-2">{d.date}</td>
+                <td className="p-2 font-bold">{d.symbol}</td>
+                <td className="text-right p-2 font-mono">{fmt(d.amount)}</td>
+                <td className="text-center p-2 text-xs">{d.currency}</td>
+                <td className="text-right p-2 font-mono text-amber-400">{fmtMoney(d.valueView, viewCurrency)}</td>
+                <td className="text-right p-2 font-mono text-xs text-green-400">${fmt(d.txSnapshot?.USD || 0)}</td>
+                <td className="text-right p-2 font-mono text-xs text-blue-400">€{fmt(d.txSnapshot?.EUR || 0)}</td>
+                <td className="text-right p-2 font-mono text-xs text-yellow-400">${fmt(d.txSnapshot?.COP || 0, 0)}</td>
+                <td className="p-2 text-right whitespace-nowrap">
+                  <button onClick={() => setModal({ open: true, dividendToEdit: d })} className="text-slate-400 hover:text-white mr-2"><i className="fa-solid fa-pen text-xs"></i></button>
+                  <button onClick={() => deleteDiv(d.id)} className="text-slate-400 hover:text-red-400"><i className="fa-solid fa-trash text-xs"></i></button>
+                </td>
+              </tr>
+            ))}
+            {filtered.length === 0 && <tr><td colSpan="9" className="p-8 text-center text-slate-500 text-sm">{divs.length === 0 ? 'Sin dividendos registrados.' : 'Sin resultados.'}</td></tr>}
+          </tbody>
+        </table>
+      </div>
+
+      <DividendModal open={modal.open} onClose={() => setModal({ open: false })} onSave={handleSave} dividendToEdit={modal.dividendToEdit} currentTrms={data.trms} />
+    </div>
+  );
+};
+
+/* ============================================================
+   SECCIÓN: EVOLUCIÓN + TREEMAP + KPIs
+   ============================================================ */
+const OverviewSection = ({ data, viewCurrency, snapshots }) => {
+  const [tmMode] = useState('day'); /* solo % día según elección */
+
+  const enriched = useMemo(() => {
+    const totalValueView = data.holdings.reduce((s, h) => s + convert(h.shares * (h.currentPrice || h.costBasis), h.currency, viewCurrency, data.trms), 0);
+    return data.holdings.filter(h => h.type !== 'cash').map(h => {
+      const lots = h.lots || [{ shares: h.shares, costBasis: h.costBasis, commission: h.commission || 0, purchaseDate: h.purchaseDate }];
+      const totalCostNative = lots.reduce((s, l) => s + l.shares * l.costBasis + (l.commission || 0), 0);
+      const valueNative = h.shares * (h.currentPrice || h.costBasis);
+      const plPct = totalCostNative ? ((valueNative - totalCostNative) / totalCostNative) * 100 : 0;
+      const oldest = lots.reduce((min, l) => !min || (l.purchaseDate || '') < (min.purchaseDate || min) ? l : min, null);
+      const days = oldest?.purchaseDate ? daysBetween(oldest.purchaseDate, new Date()) : 0;
+      const cagr = calcCAGR(totalCostNative, valueNative, days);
+      const value = convert(valueNative, h.currency, viewCurrency, data.trms);
+      return {
+        symbol: h.symbol,
+        value,
+        weight: totalValueView > 0 ? value / totalValueView : 0,
+        changePct: h.dayChangePct || 0,
+        plPct,
+        cagr,
+        category: h.category
+      };
+    });
+  }, [data, viewCurrency]);
+
+  /* Métricas globales */
+  const kpis = useMemo(() => {
+    let invested = 0, current = 0;
+    data.holdings.forEach(h => {
+      const lots = h.lots || [{ shares: h.shares, costBasis: h.costBasis, commission: h.commission || 0 }];
+      const totalCost = lots.reduce((s, l) => s + l.shares * l.costBasis + (l.commission || 0), 0);
+      invested += convert(totalCost, h.currency, viewCurrency, data.trms);
+      current += convert(h.shares * (h.currentPrice || h.costBasis), h.currency, viewCurrency, data.trms);
+    });
+    const realizedPL = (data.sales || []).reduce((s, sale) => s + convert(sale.realizedPL_native || 0, sale.currency, viewCurrency, data.trms), 0);
+    const totalDivs = (data.dividends || []).reduce((s, d) => s + convert(d.amount, d.currency, viewCurrency, data.trms), 0);
+
+    /* MWR via XIRR */
+    const cashflows = [];
+    data.holdings.forEach(h => {
+      (h.lots || []).forEach(lot => {
+        const total = lot.shares * lot.costBasis + (lot.commission || 0);
+        cashflows.push({ date: lot.purchaseDate, amount: -convert(total, h.currency, viewCurrency, data.trms) });
+      });
+    });
+    (data.sales || []).forEach(s => {
+      cashflows.push({ date: s.date, amount: convert(s.shares * s.sellPrice - (s.commission || 0), s.currency, viewCurrency, data.trms) });
+    });
+    (data.dividends || []).forEach(d => {
+      cashflows.push({ date: d.date, amount: convert(d.amount, d.currency, viewCurrency, data.trms) });
+    });
+    /* Valor final como cashflow positivo de hoy */
+    if (current > 0) cashflows.push({ date: new Date().toISOString().split('T')[0], amount: current });
+    cashflows.sort((a, b) => a.date.localeCompare(b.date));
+    const mwr = cashflows.length >= 2 ? xirr(cashflows) : null;
+
+    /* Drawdown desde snapshots */
+    let maxDD = 0, peak = -Infinity;
+    const snapKey = viewCurrency === 'USD' ? 'valueUSD' : viewCurrency === 'EUR' ? 'valueEUR' : 'valueCOP';
+    snapshots.forEach(s => {
+      const v = s[snapKey];
+      if (v > peak) peak = v;
+      const dd = peak > 0 ? ((v - peak) / peak) * 100 : 0;
+      if (dd < maxDD) maxDD = dd;
+    });
+
+    /* CAGR consolidado buy-and-hold del portafolio:
+       (Valor actual + ingresos por ventas + dividendos) / Inversión total inicial,
+       desde la fecha de la primera compra. Captura toda la rentabilidad acumulada. */
+    let earliestDate = null;
+    data.holdings.forEach(h => {
+      (h.lots || []).forEach(lot => {
+        if (lot.purchaseDate && (!earliestDate || lot.purchaseDate < earliestDate)) earliestDate = lot.purchaseDate;
+      });
+    });
+    const totalReturn = current + (data.sales || []).reduce((s, sale) => s + convert(sale.shares * sale.sellPrice - (sale.commission || 0), sale.currency, viewCurrency, data.trms), 0) + totalDivs;
+    const daysSinceStart = earliestDate ? daysBetween(earliestDate, new Date()) : 0;
+    const cagrPortfolio = invested > 0 && daysSinceStart > 30 ? calcCAGR(invested, totalReturn, daysSinceStart) : null;
+
+    return { invested, current, plLatent: current - invested, plPct: invested ? ((current - invested) / invested) * 100 : 0, realizedPL, totalDivs, mwr, maxDD, cagrPortfolio, daysSinceStart, earliestDate };
+  }, [data, viewCurrency, snapshots]);
+
+  /* Datos para gráfico lineal */
+  const chartData = useMemo(() => {
+    const snapKey = viewCurrency === 'USD' ? 'valueUSD' : viewCurrency === 'EUR' ? 'valueEUR' : 'valueCOP';
+    return snapshots.map(s => ({ date: s.date, value: s[snapKey] || 0 })).sort((a, b) => a.date.localeCompare(b.date));
+  }, [snapshots, viewCurrency]);
+
+  return (
+    <div className="space-y-4">
+      {/* CAGR consolidado destacado en card grande aparte */}
+      <div className="bg-gradient-to-br from-indigo-950/60 to-purple-950/40 border border-indigo-700/40 rounded-xl p-4">
+        <div className="flex items-center justify-between flex-wrap gap-3">
+          <div className="flex items-center gap-3">
+            <div className="bg-indigo-600/30 rounded-lg w-12 h-12 flex items-center justify-center">
+              <i className="fa-solid fa-chart-line text-2xl text-indigo-300"></i>
+            </div>
+            <div>
+              <div className="text-xs text-indigo-300 uppercase tracking-wider font-bold">CAGR Consolidado del Portafolio</div>
+              <div className="text-xs text-slate-400">Rentabilidad anualizada buy-and-hold desde {kpis.earliestDate || '—'} · {kpis.daysSinceStart} días</div>
+            </div>
+          </div>
+          <div className="text-right">
+            {kpis.cagrPortfolio !== null ? (
+              <>
+                <div className={`text-3xl font-bold ${kpis.cagrPortfolio >= 0 ? 'text-green-400' : 'text-red-400'}`}>{fmtPct(kpis.cagrPortfolio)}</div>
+                <div className="text-xs text-slate-400">anualizado · incluye dividendos y ventas</div>
+              </>
+            ) : (
+              <div className="text-2xl font-bold text-slate-500">— <span className="text-xs">(necesita &gt;30 días)</span></div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* KPIs ampliados - más compactos en móvil */}
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-7 gap-1.5 md:gap-2">
+        <div className="bg-slate-900 border border-slate-800 rounded-lg p-2 md:p-3"><div className="text-[10px] md:text-xs text-slate-400">Invertido</div><div className="text-sm md:text-base font-bold truncate">{fmtMoney(kpis.invested, viewCurrency)}</div></div>
+        <div className="bg-slate-900 border border-slate-800 rounded-lg p-2 md:p-3"><div className="text-[10px] md:text-xs text-slate-400">Valor actual</div><div className="text-sm md:text-base font-bold truncate">{fmtMoney(kpis.current, viewCurrency)}</div></div>
+        <div className="bg-slate-900 border border-slate-800 rounded-lg p-2 md:p-3"><div className="text-[10px] md:text-xs text-slate-400">P/L Latente</div><div className={`text-sm md:text-base font-bold truncate ${kpis.plLatent >= 0 ? 'text-green-400' : 'text-red-400'}`}>{fmtMoney(kpis.plLatent, viewCurrency)}</div></div>
+        <div className="bg-slate-900 border border-slate-800 rounded-lg p-2 md:p-3"><div className="text-[10px] md:text-xs text-slate-400">% Rentab.</div><div className={`text-sm md:text-base font-bold ${kpis.plPct >= 0 ? 'text-green-400' : 'text-red-400'}`}>{fmtPct(kpis.plPct)}</div></div>
+        <div className="bg-slate-900 border border-slate-800 rounded-lg p-2 md:p-3"><div className="text-[10px] md:text-xs text-slate-400">P/L Realizado</div><div className={`text-sm md:text-base font-bold truncate ${kpis.realizedPL >= 0 ? 'text-green-400' : 'text-red-400'}`}>{fmtMoney(kpis.realizedPL, viewCurrency)}</div></div>
+        <div className="bg-slate-900 border border-slate-800 rounded-lg p-2 md:p-3"><div className="text-[10px] md:text-xs text-slate-400">Dividendos</div><div className="text-sm md:text-base font-bold text-amber-400 truncate">{fmtMoney(kpis.totalDivs, viewCurrency)}</div></div>
+        <div className="bg-slate-900 border border-slate-800 rounded-lg p-2 md:p-3 col-span-2 sm:col-span-1"><div className="text-[10px] md:text-xs text-slate-400" title="Money-Weighted Return (XIRR)">MWR / IRR</div><div className={`text-sm md:text-base font-bold ${(kpis.mwr || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{kpis.mwr !== null ? fmtPct(kpis.mwr) : '—'}</div></div>
+      </div>
+
+      {/* Drawdown info */}
+      {kpis.maxDD < 0 && (
+        <div className="bg-red-950/20 border border-red-800/50 rounded p-2 text-xs">
+          <i className="fa-solid fa-arrow-trend-down text-red-400 mr-1"></i>
+          Drawdown máximo histórico: <span className="text-red-400 font-bold">{fmtPct(kpis.maxDD)}</span> · {snapshots.length} snapshots
+        </div>
+      )}
+
+      {/* Evolución */}
+      <div className="bg-slate-900 border border-slate-800 rounded-xl p-3">
+        <div className="text-xs text-slate-400 uppercase tracking-wider mb-2"><i className="fa-solid fa-chart-line mr-1"></i>Evolución patrimonio ({viewCurrency})</div>
+        <LineChart data={chartData} />
+      </div>
+
+      {/* Treemap */}
+      <div className="bg-slate-900 border border-slate-800 rounded-xl p-3">
+        <div className="text-xs text-slate-400 uppercase tracking-wider mb-2"><i className="fa-solid fa-table-cells-large mr-1"></i>Mapa de árbol (tamaño por valor · color por % día)</div>
+        <Treemap items={enriched} height={460} viewCurrency={viewCurrency} />
+      </div>
+    </div>
+  );
+};
+
+/* ============================================================
+   PESTAÑA PORTFOLIO (envuelve sub-pestañas)
+   ============================================================ */
+const PortfolioTab = ({ data, setData, finnhubKey, snapshots, fundamentals, setFundamentals }) => {
+  const [subtab, setSubtab] = useState('overview');
+  const [viewCurrency, setViewCurrency] = useState('USD');
+
+  return (
+    <div className="space-y-3">
+      {/* Sub-pestañas + selector moneda */}
+      <div className="flex flex-wrap justify-between items-center gap-2 border-b border-slate-800 pb-2">
+        <div className="flex gap-1 flex-wrap">
+          {[
+            { id: 'overview', label: 'Vista General', icon: 'fa-gauge' },
+            { id: 'positions', label: 'Posiciones', icon: 'fa-list' },
+            { id: 'sales', label: 'Ventas', icon: 'fa-arrow-trend-down' },
+            { id: 'dividends', label: 'Dividendos', icon: 'fa-coins' }
+          ].map(t => (
+            <button key={t.id} onClick={() => setSubtab(t.id)} className={`px-3 py-1.5 text-sm rounded transition-colors ${
+              subtab === t.id ? 'bg-cyan-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+            }`}><i className={`fa-solid ${t.icon} mr-1.5`}></i>{t.label}</button>
+          ))}
+        </div>
+        <div className="flex items-center gap-2 text-xs">
+          <span className="text-slate-400">Ver en:</span>
+          {['USD', 'EUR', 'COP'].map(c => (
+            <button key={c} onClick={() => setViewCurrency(c)} className={`px-2 py-1 rounded ${
+              viewCurrency === c ? 'bg-white text-slate-900 font-bold' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+            }`}>{c}</button>
+          ))}
+        </div>
+      </div>
+
+      {subtab === 'overview' && <OverviewSection data={data} viewCurrency={viewCurrency} snapshots={snapshots} />}
+      {subtab === 'positions' && <PositionsSection data={data} setData={setData} viewCurrency={viewCurrency} finnhubKey={finnhubKey} fundamentals={fundamentals} setFundamentals={setFundamentals} />}
+      {subtab === 'sales' && <SalesSection data={data} setData={setData} viewCurrency={viewCurrency} />}
+      {subtab === 'dividends' && <DividendsSection data={data} setData={setData} viewCurrency={viewCurrency} />}
+    </div>
+  );
+};
+
+/* ============================================================
+   MARKET PULSE (sin cambios sustanciales vs v2.1)
+   ============================================================ */
+const MarketPulseTab = ({ data, finnhubKey }) => {
+  const { showToast } = useToast();
+  const [quotes, setQuotes] = useState({});
+  const [sparks, setSparks] = useState({});
+  const [macroData, setMacroData] = useState({});
+  const [earnings, setEarnings] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [lastUpdate, setLastUpdate] = useState(null);
+
+  const symbols = useMemo(() => [...new Set(data.holdings.filter(h => h.type !== 'cash').map(h => h.symbol))], [data]);
+
+  const loadAll = async () => {
+    if (!finnhubKey) { showToast('Falta Finnhub key', 'error'); return; }
+    setLoading(true);
+    const newQ = {}, newS = {};
+    for (const sym of symbols) {
+      try {
+        const [q, c] = await Promise.all([finnhub.quote(sym, finnhubKey), finnhub.candles(sym, finnhubKey, 'D', 30)]);
+        if (q.c > 0) newQ[sym] = q;
+        if (c.s === 'ok' && c.c) newS[sym] = c.c;
+        await new Promise(r => setTimeout(r, 80));
+      } catch (e) { console.warn(sym); }
+    }
+    setQuotes(newQ); setSparks(newS);
+
+    const [vix, dxy, us10y, gold, eurusd, btc] = await Promise.all([
+      macro.fetchStooq('^vix'), macro.fetchStooq('dx.f'), macro.fetchStooq('10usy.b'),
+      macro.fetchStooq('xauusd'), macro.fetchStooq('eurusd'), macro.btc()
+    ]);
+    setMacroData({ vix, dxy, us10y, gold, eurusd, btc });
+
+    try {
+      const e = await finnhub.earnings(finnhubKey, 30);
+      setEarnings((e.earningsCalendar || []).filter(x => symbols.includes(x.symbol)).sort((a, b) => a.date.localeCompare(b.date)));
+    } catch (e) { /* */ }
+
+    setLastUpdate(new Date());
+    setLoading(false);
+    showToast('Market Pulse actualizado', 'success');
+  };
+
+  useEffect(() => { if (symbols.length && finnhubKey) loadAll(); /* eslint-disable-next-line */ }, []);
+
+  const MacroCard = ({ label, value, unit = '' }) => {
+    if (!value) return <div className="bg-slate-900 border border-slate-800 rounded-lg p-3"><div className="text-xs text-slate-400">{label}</div><div className="text-slate-600">—</div></div>;
+    return (
+      <div className="bg-slate-900 border border-slate-800 rounded-lg p-3">
+        <div className="text-xs text-slate-400">{label}</div>
+        <div className="text-lg font-bold">{fmt(value.close)}{unit}</div>
+        <div className={`text-xs font-mono ${value.changePct >= 0 ? 'text-green-400' : 'text-red-400'}`}>{fmtPct(value.changePct)}</div>
+      </div>
+    );
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex justify-between items-center flex-wrap gap-2">
+        <div className="flex items-center gap-3">
+          <h2 className="text-lg font-bold"><i className="fa-solid fa-wave-square text-cyan-400 mr-2"></i>Market Pulse</h2>
+          {lastUpdate && <span className="text-xs text-slate-500"><span className="pulse-dot inline-block w-2 h-2 rounded-full bg-green-500 mr-1"></span>{lastUpdate.toLocaleTimeString('es-ES')}</span>}
+        </div>
+        <button onClick={loadAll} disabled={loading} className="bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 px-3 py-1.5 rounded text-sm">
+          <i className={`fa-solid fa-rotate ${loading ? 'fa-spin' : ''} mr-1`}></i>Actualizar
+        </button>
+      </div>
+
+      <div>
+        <div className="text-xs text-slate-400 mb-2 uppercase tracking-wider">Macro</div>
+        <div className="grid grid-cols-3 md:grid-cols-6 gap-2">
+          <MacroCard label="VIX" value={macroData.vix} />
+          <MacroCard label="DXY" value={macroData.dxy} />
+          <MacroCard label="US10Y" value={macroData.us10y} unit="%" />
+          <MacroCard label="Oro" value={macroData.gold} />
+          <MacroCard label="EUR/USD" value={macroData.eurusd} />
+          <MacroCard label="BTC" value={macroData.btc} />
+        </div>
+      </div>
+
+      <div>
+        <div className="text-xs text-slate-400 mb-2 uppercase tracking-wider">Tickers</div>
+        <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-slate-800 text-xs text-slate-400">
+              <tr><th className="text-left p-2">Símbolo</th><th className="text-right p-2">Precio</th><th className="text-right p-2">% Día</th><th className="text-right p-2">H/L</th><th className="text-center p-2">30D</th></tr>
+            </thead>
+            <tbody>
+              {symbols.map(sym => {
+                const q = quotes[sym];
+                return (
+                  <tr key={sym} className="border-t border-slate-800 hover:bg-slate-800/30">
+                    <td className="p-2 font-bold">{sym}</td>
+                    <td className="text-right p-2 font-mono">{q ? fmt(q.c) : '—'}</td>
+                    <td className={`text-right p-2 font-mono ${q && q.dp >= 0 ? 'text-green-400' : 'text-red-400'}`}>{q ? fmtPct(q.dp) : '—'}</td>
+                    <td className="text-right p-2 font-mono text-xs text-slate-400">{q ? `${fmt(q.h)}/${fmt(q.l)}` : '—'}</td>
+                    <td className="p-2"><div className="flex justify-center"><Sparkline data={sparks[sym]} /></div></td>
+                  </tr>
+                );
+              })}
+              {symbols.length === 0 && <tr><td colSpan="5" className="p-8 text-center text-slate-500">Añade posiciones.</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <div className="text-xs text-slate-400 mb-2 uppercase tracking-wider">Earnings 30d</div>
+        <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-slate-800 text-xs text-slate-400"><tr><th className="text-left p-2">Fecha</th><th className="text-left p-2">Símbolo</th><th className="text-center p-2">Hora</th><th className="text-right p-2">EPS Est.</th><th className="text-right p-2">Rev Est.(M)</th></tr></thead>
+            <tbody>
+              {earnings.map((e, i) => (
+                <tr key={i} className="border-t border-slate-800">
+                  <td className="p-2">{e.date}</td><td className="p-2 font-bold">{e.symbol}</td>
+                  <td className="text-center p-2 text-xs">{e.hour === 'bmo' ? 'Pre' : e.hour === 'amc' ? 'Post' : '—'}</td>
+                  <td className="text-right p-2 font-mono">{e.epsEstimate ? fmt(e.epsEstimate) : '—'}</td>
+                  <td className="text-right p-2 font-mono">{e.revenueEstimate ? fmt(e.revenueEstimate / 1e6, 0) : '—'}</td>
+                </tr>
+              ))}
+              {earnings.length === 0 && <tr><td colSpan="5" className="p-6 text-center text-slate-500 text-sm">Sin earnings programados.</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+/* ============================================================
+   NEWS TAB (sin cambios sustanciales vs v2.1)
+   ============================================================ */
+const NewsTab = ({ data, finnhubKey, claudeKey }) => {
+  const { showToast } = useToast();
+  const [news, setNews] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [classifying, setClassifying] = useState(false);
+  const [filter, setFilter] = useState('all');
+  const [symbolFilter, setSymbolFilter] = useState('all');
+
+  const symbols = useMemo(() => [...new Set(data.holdings.filter(h => h.type !== 'cash').map(h => h.symbol))], [data]);
+
+  const loadNews = async () => {
+    if (!finnhubKey) { showToast('Falta Finnhub key', 'error'); return; }
+    setLoading(true);
+    const all = [];
+    for (const sym of symbols) {
+      try {
+        const items = await finnhub.news(sym, finnhubKey);
+        items.slice(0, 5).forEach(n => all.push({ ...n, symbol: sym, _id: `${sym}_${n.id}` }));
+        await new Promise(r => setTimeout(r, 80));
+      } catch (e) { }
+    }
+    all.sort((a, b) => b.datetime - a.datetime);
+    setNews(all);
+    setLoading(false);
+    showToast(`${all.length} noticias`, 'success');
+  };
+
+  const classify = async () => {
+    if (!claudeKey) { showToast('Falta Claude key', 'error'); return; }
+    if (!news.length) { showToast('Carga noticias primero', 'error'); return; }
+    setClassifying(true);
+    try {
+      const batches = [];
+      for (let i = 0; i < news.length; i += 10) batches.push(news.slice(i, i + 10));
+      const enriched = [...news];
+      let idx = 0;
+      for (const batch of batches) {
+        const results = await claudeApi.classifyNews(claudeKey, batch.map(n => ({ symbol: n.symbol, headline: n.headline, summary: n.summary })));
+        results.forEach((r, j) => { enriched[idx + j] = { ...enriched[idx + j], ...r }; });
+        idx += batch.length;
+        setNews([...enriched]);
+      }
+      showToast('Clasificación completa', 'success');
+    } catch (e) { showToast(`Error: ${e.message}`, 'error'); }
+    setClassifying(false);
+  };
+
+  const filtered = useMemo(() => news.filter(n => {
+    if (filter !== 'all' && n.impact !== filter) return false;
+    if (symbolFilter !== 'all' && n.symbol !== symbolFilter) return false;
+    return true;
+  }), [news, filter, symbolFilter]);
+
+  const counts = useMemo(() => ({
+    red: news.filter(n => n.impact === 'red').length,
+    yellow: news.filter(n => n.impact === 'yellow').length,
+    white: news.filter(n => n.impact === 'white').length
+  }), [news]);
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap justify-between items-center gap-2">
+        <h2 className="text-lg font-bold"><i className="fa-solid fa-newspaper text-amber-400 mr-2"></i>News & Catalysts</h2>
+        <div className="flex gap-2 flex-wrap">
+          <button onClick={loadNews} disabled={loading} className="bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 px-3 py-1.5 rounded text-sm">
+            <i className={`fa-solid fa-download ${loading ? 'fa-spin' : ''} mr-1`}></i>Cargar
+          </button>
+          <button onClick={classify} disabled={classifying || !news.length} className="bg-purple-600 hover:bg-purple-500 disabled:opacity-50 px-3 py-1.5 rounded text-sm">
+            <i className={`fa-solid fa-brain ${classifying ? 'fa-spin' : ''} mr-1`}></i>Clasificar IA
+          </button>
+        </div>
+      </div>
+
+      <div className="flex flex-wrap gap-2 items-center text-xs">
+        {['all', 'red', 'yellow', 'white'].map(f => (
+          <button key={f} onClick={() => setFilter(f)} className={`px-2 py-1 rounded ${filter === f ? 'bg-white text-slate-900' : 'bg-slate-800 text-slate-300'}`}>
+            {f === 'all' ? `Todas (${news.length})` : f === 'red' ? `🔴 ${counts.red}` : f === 'yellow' ? `🟡 ${counts.yellow}` : `⚪ ${counts.white}`}
+          </button>
+        ))}
+        <select value={symbolFilter} onChange={e => setSymbolFilter(e.target.value)} className="bg-slate-800 border border-slate-700 rounded p-1">
+          <option value="all">Todos los símbolos</option>
+          {symbols.map(s => <option key={s}>{s}</option>)}
+        </select>
+      </div>
+
+      <div className="space-y-2">
+        {filtered.map(n => {
+          const ic = n.impact === 'red' ? 'border-red-500/50 bg-red-950/20' : n.impact === 'yellow' ? 'border-yellow-500/50 bg-yellow-950/10' : n.impact === 'white' ? 'border-slate-700' : 'border-slate-800';
+          const dir = n.direction === 'bullish' ? '📈' : n.direction === 'bearish' ? '📉' : n.direction === 'neutral' ? '➖' : '';
+          return (
+            <a key={n._id} href={n.url} target="_blank" rel="noopener noreferrer" className={`block border ${ic} bg-slate-900/50 rounded-lg p-3 hover:border-cyan-500/50 transition-all`}>
+              <div className="flex justify-between items-start gap-3 mb-1">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="font-bold text-cyan-400 text-sm">{n.symbol}</span>
+                  {n.impact && <span className="text-xs">{n.impact === 'red' ? '🔴' : n.impact === 'yellow' ? '🟡' : '⚪'}</span>}
+                  {dir && <span className="text-xs">{dir}</span>}
+                  <span className="text-xs text-slate-500">{new Date(n.datetime * 1000).toLocaleString('es-ES', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}</span>
+                </div>
+                <span className="text-xs text-slate-500">{n.source}</span>
+              </div>
+              <div className="text-sm text-white mb-1">{n.headline}</div>
+              {n.reasoning && <div className="text-xs text-purple-300 mt-2 italic"><i className="fa-solid fa-brain mr-1"></i>{n.reasoning}</div>}
+              {!n.reasoning && n.summary && <div className="text-xs text-slate-400 mt-1 line-clamp-2">{n.summary.slice(0, 200)}</div>}
+            </a>
+          );
+        })}
+        {filtered.length === 0 && <div className="text-center text-slate-500 py-12 text-sm">{news.length === 0 ? 'Pulsa "Cargar".' : 'Sin resultados.'}</div>}
+      </div>
+    </div>
+  );
+};
+
+/* ============================================================
+   APP ROOT
+   ============================================================ */
+const App = () => {
+  const [data, setData] = useState(loadData);
+  const [snapshots, setSnapshots] = useState(loadSnapshots);
+  const [fundamentals, setFundamentals] = useState(loadFundamentals);
+  const [tab, setTab] = useState('portfolio');
+  const [finnhubKey, setFinnhubKey] = useState(() => localStorage.getItem(FINNHUB_KEY_STORE) || '');
+  const [claudeKey, setClaudeKey] = useState(() => localStorage.getItem(CLAUDE_KEY_STORE) || '');
+  const [showSettings, setShowSettings] = useState(false);
+  const [importDialog, setImportDialog] = useState({ open: false });
+  const [hidden, setHidden] = useState(() => localStorage.getItem('privacy_hidden') === 'true');
+  const fileInputRef = useRef(null);
+
+  const toggleHidden = () => {
+    setHidden(h => {
+      const next = !h;
+      localStorage.setItem('privacy_hidden', String(next));
+      window.__privacy_hidden = next;
+      return next;
+    });
+  };
+
+  /* Inicializar flag global al cargar */
+  useEffect(() => { window.__privacy_hidden = hidden; }, [hidden]);
+
+  /* Sync snapshots desde localStorage cuando cambian */
+  useEffect(() => {
+    const id = setInterval(() => {
+      const s = loadSnapshots();
+      if (JSON.stringify(s) !== JSON.stringify(snapshots)) setSnapshots(s);
+    }, 2000);
+    return () => clearInterval(id);
+  }, [snapshots]);
+
+  useEffect(() => { localStorage.setItem(FINNHUB_KEY_STORE, finnhubKey); }, [finnhubKey]);
+  useEffect(() => { localStorage.setItem(CLAUDE_KEY_STORE, claudeKey); }, [claudeKey]);
+
+  useEffect(() => {
+    const last = localStorage.getItem(LAST_BACKUP_STORE);
+    if (data.holdings.length === 0) return;
+    if (!last) { localStorage.setItem(LAST_BACKUP_STORE, new Date().toISOString()); return; }
+    const days = (Date.now() - new Date(last).getTime()) / 86400000;
+    if (days > 7) {
+      setTimeout(() => {
+        if (confirm(`Han pasado ${Math.floor(days)} días sin backup. ¿Descargar?`)) downloadBackup(data);
+        else localStorage.setItem(LAST_BACKUP_STORE, new Date().toISOString());
+      }, 2000);
+    }
+  }, []);
+
+  const updateTrm = (cur, val) => {
+    const next = { ...data, trms: { ...data.trms, [cur]: parseFloat(val) || 0 } };
+    setData(next); persistData(next);
+  };
+
+  const [fxRefreshing, setFxRefreshing] = useState(false);
+  const [fxLastUpdate, setFxLastUpdate] = useState(() => localStorage.getItem('fx_last_update') || null);
+  const [fxSource, setFxSource] = useState(() => localStorage.getItem('fx_source') || null);
+  const [fxStatus, setFxStatus] = useState(null); /* { ok, msg, date } */
+
+  const refreshFX = async (silent = false) => {
+    setFxRefreshing(true);
+    setFxStatus(null);
+    const rates = await fxRates.fetchCOP();
+    if (rates && rates.USD && rates.EUR) {
+      const next = { ...data, trms: { USD: Math.round(rates.USD * 100) / 100, EUR: Math.round(rates.EUR * 100) / 100 } };
+      setData(next); persistData(next);
+      const ts = new Date().toISOString();
+      localStorage.setItem('fx_last_update', ts);
+      localStorage.setItem('fx_source', rates.source);
+      setFxLastUpdate(ts); setFxSource(rates.source);
+      if (!silent) setFxStatus({ ok: true, msg: `TRMs actualizadas desde ${rates.source} (${rates.date})`, date: rates.date });
+    } else if (!silent) {
+      setFxStatus({ ok: false, msg: 'No se pudieron obtener TRMs (sin internet o API no disponible)' });
+    }
+    setFxRefreshing(false);
+    setTimeout(() => setFxStatus(null), 4000);
+  };
+
+  /* Auto-fetch TRMs al cargar si llevan más de 6h sin actualizar */
+  useEffect(() => {
+    const last = localStorage.getItem('fx_last_update');
+    const hoursAgo = last ? (Date.now() - new Date(last).getTime()) / 3600000 : 999;
+    if (hoursAgo > 6) {
+      setTimeout(() => refreshFX(true), 1000);
+    }
+  // eslint-disable-next-line
+  }, []);
+
+  const handleFileSelected = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(reader.result);
+        const v = validateBackup(parsed);
+        if (!v.ok) { setImportDialog({ open: true, error: v.err }); return; }
+        setImportDialog({ open: true, parsed: v.data, snapshots: v.snapshots, fundamentals: v.fundamentals, fileName: file.name });
+      } catch (err) { setImportDialog({ open: true, error: 'JSON inválido' }); }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  };
+
+  const performImport = (mode) => {
+    if (!importDialog.parsed) return;
+    let next;
+    if (mode === 'replace') {
+      next = { ...DEFAULT_DATA, ...importDialog.parsed };
+      if (importDialog.snapshots?.length) { persistSnapshots(importDialog.snapshots); setSnapshots(importDialog.snapshots); }
+      if (importDialog.fundamentals && Object.keys(importDialog.fundamentals).length) {
+        persistFundamentals(importDialog.fundamentals); setFundamentals(importDialog.fundamentals);
+      }
+    } else {
+      const ids = new Set(data.holdings.map(h => h.id));
+      const newH = importDialog.parsed.holdings.filter(h => !ids.has(h.id));
+      const sIds = new Set((data.sales || []).map(s => s.id));
+      const newS = (importDialog.parsed.sales || []).filter(s => !sIds.has(s.id));
+      const dIds = new Set((data.dividends || []).map(d => d.id));
+      const newD = (importDialog.parsed.dividends || []).filter(d => !dIds.has(d.id));
+      next = { ...data, holdings: [...data.holdings, ...newH], sales: [...(data.sales || []), ...newS], dividends: [...(data.dividends || []), ...newD] };
+    }
+    setData(next); persistData(next);
+    setImportDialog({ open: false });
+  };
+
+  return (
+    <ToastProvider>
+      <PrivacyContext.Provider value={{ hidden, toggleHidden }}>
+      <div className="min-h-screen p-2 md:p-4 max-w-7xl mx-auto">
+        <header className="mb-4">
+          <div className="flex justify-between items-center flex-wrap gap-2">
+            <div>
+              <h1 className="text-2xl font-bold"><i className="fa-solid fa-chart-line text-cyan-400 mr-2"></i>Portfolio Cockpit <span className="text-xs text-slate-500 font-normal">v{APP_VERSION}</span></h1>
+              <p className="text-xs text-slate-400">FIFO · Multi-divisa · CAGR/MWR · Treemap · Evolución · IA</p>
+            </div>
+            <div className="flex items-center gap-2 flex-wrap">
+              {/* TRM indicator en header - se oculta en modo discreto */}
+              {!hidden && (
+                <div className="bg-slate-800/70 border border-slate-700 rounded-lg px-3 py-1.5 text-xs flex items-center gap-2">
+                  <i className="fa-solid fa-globe text-yellow-400"></i>
+                  <div className="flex flex-col leading-tight">
+                    <span className="text-slate-300">USD <span className="font-mono text-white">{fmt(data.trms.USD, 0)}</span></span>
+                    <span className="text-slate-300">EUR <span className="font-mono text-white">{fmt(data.trms.EUR, 0)}</span></span>
+                  </div>
+                  <button onClick={() => refreshFX(false)} disabled={fxRefreshing} title="Refrescar TRMs desde BCE" className="text-cyan-400 hover:text-cyan-300 disabled:opacity-50 ml-1">
+                    <i className={`fa-solid fa-rotate ${fxRefreshing ? 'fa-spin' : ''}`}></i>
+                  </button>
+                </div>
+              )}
+              <button onClick={toggleHidden} title={hidden ? 'Mostrar valores' : 'Ocultar valores'} className={`px-3 py-1.5 rounded text-sm ${hidden ? 'bg-amber-700 hover:bg-amber-600' : 'bg-slate-800 hover:bg-slate-700'}`}>
+                <i className={`fa-solid ${hidden ? 'fa-eye-slash' : 'fa-eye'}`}></i>
+                <span className="hidden sm:inline ml-1">{hidden ? 'Discreto' : 'Visible'}</span>
+              </button>
+              <button onClick={() => setShowSettings(s => !s)} className="bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded text-sm">
+                <i className="fa-solid fa-cog"></i>
+                <span className="hidden sm:inline ml-1">Config</span>
+              </button>
+            </div>
+          </div>
+
+          <nav className="flex gap-1 mt-4 border-b border-slate-800 overflow-x-auto">
+            {[
+              { id: 'portfolio', label: 'Portfolio', icon: 'fa-briefcase' },
+              { id: 'pulse', label: 'Market Pulse', icon: 'fa-wave-square' },
+              { id: 'news', label: 'News & Catalysts', icon: 'fa-newspaper' }
+            ].map(t => (
+              <button key={t.id} onClick={() => setTab(t.id)} className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors whitespace-nowrap ${
+                tab === t.id ? 'border-cyan-400 text-cyan-400' : 'border-transparent text-slate-400 hover:text-white'
+              }`}><i className={`fa-solid ${t.icon} mr-1.5`}></i>{t.label}</button>
+            ))}
+          </nav>
+        </header>
+
+        {showSettings && (
+          <div className="bg-slate-900 border border-slate-700 rounded-xl p-4 mb-4 space-y-4 animate-fade-in">
+            <div>
+              <h3 className="font-bold text-amber-400 text-sm uppercase tracking-wider mb-2"><i className="fa-solid fa-shield mr-1"></i>Backup & Restore</h3>
+              <div className="flex flex-wrap gap-2">
+                <button onClick={() => downloadBackup(data)} className="bg-green-600 hover:bg-green-500 px-3 py-2 rounded text-sm"><i className="fa-solid fa-download mr-1"></i>Backup JSON (incl. snapshots)</button>
+                <button onClick={() => fileInputRef.current?.click()} className="bg-blue-600 hover:bg-blue-500 px-3 py-2 rounded text-sm"><i className="fa-solid fa-upload mr-1"></i>Importar JSON</button>
+                <button onClick={() => exportLedgerCSV(data, 'all')} className="bg-purple-600 hover:bg-purple-500 px-3 py-2 rounded text-sm"><i className="fa-solid fa-file-csv mr-1"></i>Libro contable completo</button>
+                <input ref={fileInputRef} type="file" accept=".json" onChange={handleFileSelected} className="hidden" />
+              </div>
+              <div className="text-xs text-slate-500 mt-2">
+                <i className="fa-solid fa-circle-info mr-1 text-cyan-400"></i>
+                Backup incluye lotes FIFO, snapshots de patrimonio y TRMs históricas por transacción. CSV listo para auditoría contable.
+              </div>
+            </div>
+
+            <div className="border-t border-slate-800 pt-4">
+              <h3 className="font-bold text-orange-400 text-sm uppercase tracking-wider mb-2"><i className="fa-solid fa-wrench mr-1"></i>Reparación de datos</h3>
+              <div className="flex flex-wrap gap-2">
+                <button onClick={() => {
+                  const before = data.holdings.length;
+                  const next = { ...data, holdings: consolidateHoldings(data.holdings) };
+                  const after = next.holdings.length;
+                  setData(next); persistData(next);
+                  alert(`Consolidación completa: ${before} → ${after} holdings (${before - after} duplicados fusionados)`);
+                }} className="bg-orange-600 hover:bg-orange-500 px-3 py-2 rounded text-sm">
+                  <i className="fa-solid fa-compress mr-1"></i>Forzar consolidación por símbolo
+                </button>
+              </div>
+              <div className="text-xs text-slate-500 mt-2">
+                <i className="fa-solid fa-circle-info mr-1 text-orange-400"></i>
+                Si ves símbolos duplicados (NVDA aparece 2 veces en vez de consolidado con lotes), pulsa este botón. Es idempotente — no afecta data correcta.
+              </div>
+            </div>
+
+            <div className="border-t border-slate-800 pt-4">
+              <h3 className="font-bold text-cyan-400 text-sm uppercase tracking-wider mb-2">API Keys</h3>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-slate-400 block mb-1"><a href="https://finnhub.io/register" target="_blank" rel="noopener" className="hover:underline">Finnhub <i className="fa-solid fa-arrow-up-right-from-square text-[0.6rem]"></i></a></label>
+                  <input type="password" value={finnhubKey} onChange={e => setFinnhubKey(e.target.value)} className="w-full bg-slate-950 border border-slate-700 rounded p-2 text-sm" />
+                </div>
+                <div>
+                  <label className="text-xs text-slate-400 block mb-1"><a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener" className="hover:underline">Claude <i className="fa-solid fa-arrow-up-right-from-square text-[0.6rem]"></i></a></label>
+                  <input type="password" value={claudeKey} onChange={e => setClaudeKey(e.target.value)} className="w-full bg-slate-950 border border-slate-700 rounded p-2 text-sm" />
+                </div>
+              </div>
+            </div>
+
+            <div className="border-t border-slate-800 pt-4">
+              <div className="flex items-center justify-between flex-wrap gap-2 mb-2">
+                <h3 className="font-bold text-yellow-400 text-sm uppercase tracking-wider"><i className="fa-solid fa-globe mr-1"></i>TRMs en tiempo real</h3>
+                <button onClick={() => refreshFX(false)} disabled={fxRefreshing} className="bg-yellow-700 hover:bg-yellow-600 disabled:opacity-50 px-3 py-1 rounded text-xs font-bold">
+                  <i className={`fa-solid fa-rotate ${fxRefreshing ? 'fa-spin' : ''} mr-1`}></i>{fxRefreshing ? 'Obteniendo...' : 'Actualizar desde BCE'}
+                </button>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-slate-400 block mb-1">USD/COP</label>
+                  <input type="number" step="any" value={data.trms.USD} onChange={e => updateTrm('USD', e.target.value)} className="w-full bg-slate-950 border border-slate-700 rounded p-2 text-sm" />
+                </div>
+                <div>
+                  <label className="text-xs text-slate-400 block mb-1">EUR/COP</label>
+                  <input type="number" step="any" value={data.trms.EUR} onChange={e => updateTrm('EUR', e.target.value)} className="w-full bg-slate-950 border border-slate-700 rounded p-2 text-sm" />
+                </div>
+              </div>
+              {fxLastUpdate && (
+                <div className="text-xs text-slate-500 mt-2">
+                  <i className="fa-solid fa-clock mr-1"></i>Última actualización: {new Date(fxLastUpdate).toLocaleString('es-ES')} {fxSource && <span className="text-cyan-400">· fuente: {fxSource}</span>}
+                </div>
+              )}
+              {fxStatus && (
+                <div className={`text-xs mt-2 p-2 rounded ${fxStatus.ok ? 'bg-green-950/40 text-green-300 border border-green-800' : 'bg-red-950/40 text-red-300 border border-red-800'}`}>
+                  <i className={`fa-solid ${fxStatus.ok ? 'fa-circle-check' : 'fa-triangle-exclamation'} mr-1`}></i>{fxStatus.msg}
+                </div>
+              )}
+              <div className="text-xs text-slate-500 mt-2">
+                <i className="fa-solid fa-circle-info mr-1 text-cyan-400"></i>Fuente: Banco Central Europeo (BCE) vía frankfurter.app. Auto-refresh si llevan más de 6 horas sin actualizar. Cada transacción guarda su propia TRM histórica.
+              </div>
+            </div>
+
+            <div className="border-t border-slate-800 pt-4 text-xs text-slate-500">
+              <div>Snapshots históricos: <span className="font-mono text-slate-300">{snapshots.length}</span></div>
+              <div>Posiciones: <span className="font-mono text-slate-300">{data.holdings.length}</span> · Lotes totales: <span className="font-mono text-slate-300">{data.holdings.reduce((s, h) => s + (h.lots?.length || 0), 0)}</span></div>
+              <div>Ventas: <span className="font-mono text-slate-300">{(data.sales || []).length}</span> · Dividendos: <span className="font-mono text-slate-300">{(data.dividends || []).length}</span></div>
+            </div>
+          </div>
+        )}
+
+        <main>
+          {tab === 'portfolio' && <PortfolioTab data={data} setData={setData} finnhubKey={finnhubKey} snapshots={snapshots} fundamentals={fundamentals} setFundamentals={setFundamentals} />}
+          {tab === 'pulse' && <MarketPulseTab data={data} finnhubKey={finnhubKey} />}
+          {tab === 'news' && <NewsTab data={data} finnhubKey={finnhubKey} claudeKey={claudeKey} />}
+        </main>
+
+        <footer className="text-center text-xs text-slate-600 mt-8 py-4">
+          Finnhub · Stooq · CoinGecko · Claude Haiku 4.5 · v{APP_VERSION} · Audit-ready multi-divisa con FIFO
+        </footer>
+
+        {importDialog.open && (
+          <div className="fixed inset-0 bg-black/80 z-[60] flex items-center justify-center p-4 animate-fade-in">
+            <div className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-md p-5">
+              <h3 className="font-bold text-blue-400 mb-3"><i className="fa-solid fa-upload mr-1"></i>Importar</h3>
+              {importDialog.error ? (
+                <div className="space-y-3">
+                  <div className="bg-red-950/40 border border-red-700/50 rounded p-3 text-sm text-red-300"><i className="fa-solid fa-triangle-exclamation mr-1"></i>{importDialog.error}</div>
+                  <button onClick={() => setImportDialog({ open: false })} className="w-full bg-slate-700 py-2 rounded">Cerrar</button>
+                </div>
+              ) : (
+                <div className="space-y-3 text-sm">
+                  <div className="bg-slate-800/50 rounded p-3 space-y-1">
+                    <div className="text-xs text-slate-400">Archivo: <span className="text-white">{importDialog.fileName}</span></div>
+                    <div className="text-xs text-slate-400">Posiciones: <span className="text-white">{importDialog.parsed.holdings.length}</span></div>
+                    <div className="text-xs text-slate-400">Ventas: <span className="text-white">{(importDialog.parsed.sales || []).length}</span></div>
+                    <div className="text-xs text-slate-400">Dividendos: <span className="text-white">{(importDialog.parsed.dividends || []).length}</span></div>
+                    <div className="text-xs text-slate-400">Snapshots: <span className="text-white">{(importDialog.snapshots || []).length}</span></div>
+                  </div>
+                  <button onClick={() => performImport('merge')} className="w-full bg-blue-600 hover:bg-blue-500 py-2 rounded text-sm"><i className="fa-solid fa-code-merge mr-1"></i>Fusionar (sin duplicar)</button>
+                  <button onClick={() => { if (confirm('Esto reemplazará TODOS tus datos. ¿Seguir?')) performImport('replace'); }} className="w-full bg-red-600 hover:bg-red-500 py-2 rounded text-sm"><i className="fa-solid fa-rotate mr-1"></i>Reemplazar todo</button>
+                  <button onClick={() => setImportDialog({ open: false })} className="w-full bg-slate-700 py-2 rounded text-sm">Cancelar</button>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+      </PrivacyContext.Provider>
+    </ToastProvider>
+  );
+};
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+</script>
+</body>
+</html>
