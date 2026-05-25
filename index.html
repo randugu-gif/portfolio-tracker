@@ -3,12 +3,14 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Portfolio Cockpit v2.6</title>
+<title>Portfolio Cockpit v2.8</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" />
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script src="https://apis.google.com/js/api.js" async defer></script>
 <style>
   body { background: #020617; color: #fff; font-family: ui-sans-serif, system-ui, -apple-system; }
   .animate-fade-in { animation: fadeIn 0.2s ease-out; }
@@ -35,7 +37,11 @@ const FUNDAMENTALS_KEY = 'portfolio_fundamentals_v2';
 const FINNHUB_KEY_STORE = 'finnhub_api_key';
 const CLAUDE_KEY_STORE = 'claude_api_key';
 const LAST_BACKUP_STORE = 'last_backup_date';
-const APP_VERSION = '2.6';
+const APP_VERSION = '2.8';
+/* Google Drive sync - Client ID OAuth */
+const GOOGLE_CLIENT_ID = '662425658697-6f6f4m8e6cumflp6kjo9qn0grv6627v8.apps.googleusercontent.com';
+const GDRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
+const GDRIVE_FILENAME = 'portfolio_cockpit_data.json';
 
 const DEFAULT_DATA = {
   version: APP_VERSION,
@@ -186,6 +192,27 @@ const loadData = () => {
 };
 
 /* Función reutilizable de consolidación por símbolo+type */
+/* Detecta holdings que deben ocultarse en v2.7+ por ser "pseudo-cash" o vacíos:
+   - type === 'cash' (legacy explícito)
+   - símbolos típicos de efectivo (EFECTIVO, CASH, EURO, USD, COP) sin shares reales
+   - holdings con shares === 0 o sin lotes activos
+   NOTA: respeta la flag showLegacyCash en localStorage si el usuario quiere verlos. */
+const CASH_SYMBOLS = ['EFECTIVO', 'CASH', 'EURO', 'EUR', 'USD', 'COP', 'DOLAR', 'DÓLAR', 'PESOS'];
+
+const isPseudoCashOrEmpty = (h) => {
+  if (!h) return true;
+  /* Legacy explícito */
+  if (h.type === 'cash') return true;
+  /* Símbolo típico de cash */
+  const sym = (h.symbol || '').trim().toUpperCase();
+  if (CASH_SYMBOLS.includes(sym)) return true;
+  /* Sin lotes o cantidad cero */
+  const totalShares = (h.lots || []).reduce((s, l) => s + (l.shares || 0), 0);
+  if (totalShares <= 0.0001 && !h.shares) return true;
+  if (h.shares !== undefined && Math.abs(h.shares) < 0.0001) return true;
+  return false;
+};
+
 const consolidateHoldings = (holdings) => {
   const consolidated = [];
   const bySymbol = {};
@@ -397,6 +424,129 @@ const finnhub = {
 };
 
 /* FX rates en tiempo real desde frankfurter.app (BCE oficial, sin API key, CORS abierto) */
+/* ============================================================
+   GOOGLE DRIVE SYNC
+   Usa Google Identity Services (GIS) para OAuth + Drive API v3.
+   Scope drive.file: la app solo ve archivos que ella misma crea.
+   ============================================================ */
+const gdrive = {
+  tokenClient: null,
+  accessToken: null,
+  fileId: null,
+
+  /* Inicializa el cliente de tokens. Se llama una vez que GIS cargó. */
+  initTokenClient(onToken) {
+    if (!window.google || !window.google.accounts || !window.google.accounts.oauth2) {
+      return false;
+    }
+    this.tokenClient = window.google.accounts.oauth2.initTokenClient({
+      client_id: GOOGLE_CLIENT_ID,
+      scope: GDRIVE_SCOPE,
+      callback: (resp) => {
+        if (resp.error) { onToken(null, resp.error); return; }
+        this.accessToken = resp.access_token;
+        onToken(resp.access_token, null);
+      }
+    });
+    return true;
+  },
+
+  /* Solicita autorización (abre popup de Google la primera vez) */
+  requestAuth(interactive = true) {
+    if (!this.tokenClient) return;
+    this.tokenClient.requestAccessToken({ prompt: interactive ? 'consent' : '' });
+  },
+
+  /* Revoca el token (desconectar) */
+  signOut() {
+    if (this.accessToken && window.google?.accounts?.oauth2) {
+      window.google.accounts.oauth2.revoke(this.accessToken, () => {});
+    }
+    this.accessToken = null;
+    this.fileId = null;
+  },
+
+  /* Busca el archivo de datos en Drive. Devuelve el fileId o null. */
+  async findFile() {
+    if (!this.accessToken) throw new Error('Sin autorización');
+    const q = encodeURIComponent(`name='${GDRIVE_FILENAME}' and trashed=false`);
+    const r = await fetch(`https://www.googleapis.com/drive/v3/files?q=${q}&spaces=drive&fields=files(id,name,modifiedTime)`, {
+      headers: { Authorization: `Bearer ${this.accessToken}` }
+    });
+    if (!r.ok) throw new Error(`Drive search error ${r.status}`);
+    const j = await r.json();
+    if (j.files && j.files.length > 0) {
+      this.fileId = j.files[0].id;
+      return { id: j.files[0].id, modifiedTime: j.files[0].modifiedTime };
+    }
+    return null;
+  },
+
+  /* Lee el contenido del archivo de datos */
+  async readFile() {
+    if (!this.fileId) {
+      const found = await this.findFile();
+      if (!found) return null;
+    }
+    const r = await fetch(`https://www.googleapis.com/drive/v3/files/${this.fileId}?alt=media`, {
+      headers: { Authorization: `Bearer ${this.accessToken}` }
+    });
+    if (!r.ok) throw new Error(`Drive read error ${r.status}`);
+    return r.json();
+  },
+
+  /* Guarda (crea o actualiza) el archivo de datos */
+  async writeFile(payload) {
+    if (!this.accessToken) throw new Error('Sin autorización');
+    const content = JSON.stringify(payload, null, 2);
+    const metadata = { name: GDRIVE_FILENAME, mimeType: 'application/json' };
+
+    if (!this.fileId) {
+      await this.findFile(); /* intenta localizar uno existente */
+    }
+
+    if (this.fileId) {
+      /* Actualizar archivo existente (multipart) */
+      const boundary = 'pf_boundary_' + Date.now();
+      const body =
+        `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n` +
+        `${JSON.stringify({ name: GDRIVE_FILENAME })}\r\n` +
+        `--${boundary}\r\nContent-Type: application/json\r\n\r\n` +
+        `${content}\r\n--${boundary}--`;
+      const r = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${this.fileId}?uploadType=multipart`, {
+        method: 'PATCH',
+        headers: {
+          Authorization: `Bearer ${this.accessToken}`,
+          'Content-Type': `multipart/related; boundary=${boundary}`
+        },
+        body
+      });
+      if (!r.ok) throw new Error(`Drive update error ${r.status}`);
+      return r.json();
+    } else {
+      /* Crear archivo nuevo (multipart) */
+      const boundary = 'pf_boundary_' + Date.now();
+      const body =
+        `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n` +
+        `${JSON.stringify(metadata)}\r\n` +
+        `--${boundary}\r\nContent-Type: application/json\r\n\r\n` +
+        `${content}\r\n--${boundary}--`;
+      const r = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.accessToken}`,
+          'Content-Type': `multipart/related; boundary=${boundary}`
+        },
+        body
+      });
+      if (!r.ok) throw new Error(`Drive create error ${r.status}`);
+      const j = await r.json();
+      this.fileId = j.id;
+      return j;
+    }
+  }
+};
+
 const fxRates = {
   /* Devuelve { USD: cop_per_usd, EUR: cop_per_eur } */
   fetchCOP: async () => {
@@ -1032,17 +1182,11 @@ const PositionModal = ({ open, onClose, onSave, holdingToEdit, lotToEdit, curren
         </div>
         <form ref={formRef} onSubmit={handleSubmit} onChange={recalcPreview} className="p-4 space-y-3 text-sm">
           {isNewPosition && (
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="text-xs text-slate-400">Tipo</label>
-                <select name="type" defaultValue="asset" className="w-full bg-slate-950 border border-slate-700 rounded p-2">
-                  <option value="asset">Activo</option><option value="cash">Efectivo</option>
-                </select>
-              </div>
-              <div>
-                <label className="text-xs text-slate-400">Símbolo</label>
-                <input name="symbol" required className="w-full bg-slate-950 border border-slate-700 rounded p-2" />
-              </div>
+            <div>
+              <label className="text-xs text-slate-400">Símbolo</label>
+              <input name="symbol" required placeholder="AAPL, GOOGL, NVDA..." className="w-full bg-slate-950 border border-slate-700 rounded p-2 uppercase" />
+              {/* Tipo siempre asset en v2.7+ */}
+              <input type="hidden" name="type" value="asset" />
             </div>
           )}
           <div className="grid grid-cols-3 gap-3">
@@ -1067,7 +1211,7 @@ const PositionModal = ({ open, onClose, onSave, holdingToEdit, lotToEdit, curren
               <div>
                 <label className="text-xs text-slate-400">Categoría</label>
                 <select name="category" defaultValue="AI/Big Tech" className="w-full bg-slate-950 border border-slate-700 rounded p-2">
-                  <option>AI/Big Tech</option><option>FinTech</option><option>ETF</option><option>Healthcare</option><option>Oro</option><option>Crypto</option><option>Cash</option><option>Otros</option>
+                  <option>AI/Big Tech</option><option>FinTech</option><option>ETF</option><option>Healthcare</option><option>Oro</option><option>Crypto</option><option>Otros</option>
                 </select>
               </div>
               <div>
@@ -1337,6 +1481,20 @@ const PositionsSection = ({ data, setData, viewCurrency, finnhubKey, fundamental
   const [filterStatus, setFilterStatus] = useState('all');
   const [groupBy, setGroupBy] = useState('none');
   const [editingPrice, setEditingPrice] = useState(null);
+  /* showLegacyCash se sincroniza desde localStorage cada vez que cambia */
+  const [showLegacyCash, setShowLegacyCash] = useState(() => localStorage.getItem('show_legacy_cash') === 'true');
+
+  /* Re-leer flag cuando se modifique desde Settings */
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const cur = localStorage.getItem('show_legacy_cash') === 'true';
+      if (cur !== showLegacyCash) setShowLegacyCash(cur);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [showLegacyCash]);
+
+  /* Contar holdings legacy de cash en data raw */
+  const legacyCashCount = useMemo(() => data.holdings.filter(h => isPseudoCashOrEmpty(h)).length, [data.holdings]);
 
   const savePrice = (holdingId, newPrice) => {
     if (!newPrice || isNaN(newPrice) || newPrice <= 0) { setEditingPrice(null); return; }
@@ -1349,7 +1507,7 @@ const PositionsSection = ({ data, setData, viewCurrency, finnhubKey, fundamental
   const refreshPrices = async () => {
     if (!finnhubKey) { showToast('Falta API key', 'error'); return; }
     setRefreshing(true);
-    const symbols = [...new Set(data.holdings.filter(h => h.type !== 'cash').map(h => h.symbol))];
+    const symbols = [...new Set(data.holdings.filter(h => !isPseudoCashOrEmpty(h)).map(h => h.symbol))];
     const updates = { ...data };
     const newFundamentals = { ...fundamentals };
     let fundamentalsCount = 0;
@@ -1357,7 +1515,7 @@ const PositionsSection = ({ data, setData, viewCurrency, finnhubKey, fundamental
     for (const sym of symbols) {
       try {
         const q = await finnhub.quote(sym, finnhubKey);
-        if (q.c > 0) updates.holdings = updates.holdings.map(h => h.symbol === sym && h.type !== 'cash' ? { ...h, currentPrice: q.c, dayChangePct: q.dp } : h);
+        if (q.c > 0) updates.holdings = updates.holdings.map(h => h.symbol === sym && !isPseudoCashOrEmpty(h) ? { ...h, currentPrice: q.c, dayChangePct: q.dp } : h);
         await new Promise(r => setTimeout(r, 80));
 
         /* Fundamentales: solo si caché tiene más de 6 horas */
@@ -1396,9 +1554,11 @@ const PositionsSection = ({ data, setData, viewCurrency, finnhubKey, fundamental
 
   /* Cálculo agregado por holding */
   const enriched = useMemo(() => {
-    const totalValueUSD = data.holdings.reduce((s, h) => s + convert(h.shares * (h.currentPrice || h.costBasis), h.currency, 'USD', data.trms), 0);
+    /* Filtrar pseudo-cash y holdings vacíos a menos que el usuario lo haya activado en Config */
+    const sourceHoldings = showLegacyCash ? data.holdings : data.holdings.filter(h => !isPseudoCashOrEmpty(h));
+    const totalValueUSD = sourceHoldings.reduce((s, h) => s + convert(h.shares * (h.currentPrice || h.costBasis), h.currency, 'USD', data.trms), 0);
 
-    return data.holdings.map(h => {
+    return sourceHoldings.map(h => {
       const lots = h.lots || [{ shares: h.shares, costBasis: h.costBasis, commission: h.commission || 0, purchaseDate: h.purchaseDate, txSnapshot: h.txSnapshot, txTrms: h.txTrms }];
       const totalShares = lots.reduce((s, l) => s + l.shares, 0);
       const totalCostNative = lots.reduce((s, l) => s + l.shares * l.costBasis + (l.commission || 0), 0);
@@ -1438,7 +1598,7 @@ const PositionsSection = ({ data, setData, viewCurrency, finnhubKey, fundamental
         oldestDate: oldestLot?.purchaseDate
       };
     });
-  }, [data, viewCurrency, fundamentals]);
+  }, [data, viewCurrency, fundamentals, showLegacyCash]);
 
   const filtered = useMemo(() => {
     let list = enriched.filter(h => {
@@ -1558,9 +1718,19 @@ const PositionsSection = ({ data, setData, viewCurrency, finnhubKey, fundamental
       const newLots = h.lots.filter(l => l.id !== lotId);
       const newShares = newLots.reduce((s, l) => s + l.shares, 0);
       return { ...h, lots: newLots, shares: newShares };
-    }).filter(h => (h.lots && h.lots.length > 0) || h.type === 'cash')};
+    }).filter(h => (h.lots && h.lots.length > 0))};
     setData(next); persistData(next);
     showToast('Lote eliminado', 'success');
+  };
+
+  const deleteHolding = (holdingId) => {
+    const h = data.holdings.find(x => x.id === holdingId);
+    if (!h) return;
+    const label = h.symbol || 'esta posición';
+    if (!confirm(`¿Eliminar TODA la posición ${label}? Esto borra todos los lotes asociados. La acción NO se puede deshacer (excepto restaurando un backup).`)) return;
+    const next = { ...data, holdings: data.holdings.filter(x => x.id !== holdingId) };
+    setData(next); persistData(next);
+    showToast(`${label} eliminada`, 'success');
   };
 
   const renderRow = (h) => {
@@ -1616,7 +1786,8 @@ const PositionsSection = ({ data, setData, viewCurrency, finnhubKey, fundamental
           <td className="text-center p-1.5 md:p-2 text-slate-400 hidden lg:table-cell">{h.category || '—'}</td>
           <td className="p-1.5 md:p-2 text-right whitespace-nowrap" onClick={e => e.stopPropagation()}>
             <button onClick={() => setPosModal({ open: true, mode: 'addLot', holdingToEdit: h })} className="text-indigo-400 hover:text-indigo-300 mr-1 md:mr-2" title="Añadir compra"><i className="fa-solid fa-plus text-xs"></i></button>
-            {h.type !== 'cash' && <button onClick={() => setSellModal({ open: true, holding: h })} className="text-red-400 hover:text-red-300" title="Vender FIFO"><i className="fa-solid fa-arrow-trend-down text-xs"></i></button>}
+            {h.type !== 'cash' && <button onClick={() => setSellModal({ open: true, holding: h })} className="text-red-400 hover:text-red-300 mr-1 md:mr-2" title="Vender FIFO"><i className="fa-solid fa-arrow-trend-down text-xs"></i></button>}
+            <button onClick={() => deleteHolding(h.id)} className="text-slate-500 hover:text-red-400" title="Eliminar posición completa"><i className="fa-solid fa-trash text-xs"></i></button>
           </td>
         </tr>
         {isExpanded && (
@@ -1699,6 +1870,18 @@ const PositionsSection = ({ data, setData, viewCurrency, finnhubKey, fundamental
 
   return (
     <div className="space-y-3">
+      {legacyCashCount > 0 && !showLegacyCash && (
+        <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-2.5 text-xs text-slate-400 flex items-center justify-between gap-2">
+          <span>
+            <i className="fa-solid fa-eye-slash mr-1 text-slate-500"></i>
+            {legacyCashCount} posición(es) ocultas (efectivo o saldo cero). Sigue en backup.
+          </span>
+          <button onClick={() => {
+            localStorage.setItem('show_legacy_cash', 'true');
+            setShowLegacyCash(true);
+          }} className="text-cyan-400 hover:underline">Mostrar</button>
+        </div>
+      )}
       {/* Toolbar */}
       <div className="flex flex-wrap gap-2 items-center">
         <div className="flex-1 min-w-[200px] relative">
@@ -2075,8 +2258,9 @@ const OverviewSection = ({ data, viewCurrency, snapshots }) => {
   const [tmMode] = useState('day'); /* solo % día según elección */
 
   const enriched = useMemo(() => {
-    const totalValueView = data.holdings.reduce((s, h) => s + convert(h.shares * (h.currentPrice || h.costBasis), h.currency, viewCurrency, data.trms), 0);
-    return data.holdings.filter(h => h.type !== 'cash').map(h => {
+    const realHoldings = data.holdings.filter(h => !isPseudoCashOrEmpty(h));
+    const totalValueView = realHoldings.reduce((s, h) => s + convert(h.shares * (h.currentPrice || h.costBasis), h.currency, viewCurrency, data.trms), 0);
+    return realHoldings.map(h => {
       const lots = h.lots || [{ shares: h.shares, costBasis: h.costBasis, commission: h.commission || 0, purchaseDate: h.purchaseDate }];
       const totalCostNative = lots.reduce((s, l) => s + l.shares * l.costBasis + (l.commission || 0), 0);
       const valueNative = h.shares * (h.currentPrice || h.costBasis);
@@ -2099,8 +2283,10 @@ const OverviewSection = ({ data, viewCurrency, snapshots }) => {
 
   /* Métricas globales */
   const kpis = useMemo(() => {
+    /* Filtrar pseudo-cash y holdings vacíos para que no distorsionen KPIs */
+    const realHoldings = data.holdings.filter(h => !isPseudoCashOrEmpty(h));
     let invested = 0, current = 0;
-    data.holdings.forEach(h => {
+    realHoldings.forEach(h => {
       const lots = h.lots || [{ shares: h.shares, costBasis: h.costBasis, commission: h.commission || 0 }];
       const totalCost = lots.reduce((s, l) => s + l.shares * l.costBasis + (l.commission || 0), 0);
       invested += convert(totalCost, h.currency, viewCurrency, data.trms);
@@ -2111,7 +2297,7 @@ const OverviewSection = ({ data, viewCurrency, snapshots }) => {
 
     /* MWR via XIRR */
     const cashflows = [];
-    data.holdings.forEach(h => {
+    realHoldings.forEach(h => {
       (h.lots || []).forEach(lot => {
         const total = lot.shares * lot.costBasis + (lot.commission || 0);
         cashflows.push({ date: lot.purchaseDate, amount: -convert(total, h.currency, viewCurrency, data.trms) });
@@ -2142,7 +2328,7 @@ const OverviewSection = ({ data, viewCurrency, snapshots }) => {
        (Valor actual + ingresos por ventas + dividendos) / Inversión total inicial,
        desde la fecha de la primera compra. Captura toda la rentabilidad acumulada. */
     let earliestDate = null;
-    data.holdings.forEach(h => {
+    realHoldings.forEach(h => {
       (h.lots || []).forEach(lot => {
         if (lot.purchaseDate && (!earliestDate || lot.purchaseDate < earliestDate)) earliestDate = lot.purchaseDate;
       });
@@ -2274,7 +2460,7 @@ const MarketPulseTab = ({ data, finnhubKey }) => {
   const [loading, setLoading] = useState(false);
   const [lastUpdate, setLastUpdate] = useState(null);
 
-  const symbols = useMemo(() => [...new Set(data.holdings.filter(h => h.type !== 'cash').map(h => h.symbol))], [data]);
+  const symbols = useMemo(() => [...new Set(data.holdings.filter(h => !isPseudoCashOrEmpty(h)).map(h => h.symbol))], [data]);
 
   const loadAll = async () => {
     if (!finnhubKey) { showToast('Falta Finnhub key', 'error'); return; }
@@ -2403,7 +2589,7 @@ const NewsTab = ({ data, finnhubKey, claudeKey }) => {
   const [filter, setFilter] = useState('all');
   const [symbolFilter, setSymbolFilter] = useState('all');
 
-  const symbols = useMemo(() => [...new Set(data.holdings.filter(h => h.type !== 'cash').map(h => h.symbol))], [data]);
+  const symbols = useMemo(() => [...new Set(data.holdings.filter(h => !isPseudoCashOrEmpty(h)).map(h => h.symbol))], [data]);
 
   const loadNews = async () => {
     if (!finnhubKey) { showToast('Falta Finnhub key', 'error'); return; }
@@ -2521,6 +2707,149 @@ const App = () => {
   const [importDialog, setImportDialog] = useState({ open: false });
   const [hidden, setHidden] = useState(() => localStorage.getItem('privacy_hidden') === 'true');
   const fileInputRef = useRef(null);
+
+  /* ===== Google Drive sync states ===== */
+  const [gdriveReady, setGdriveReady] = useState(false); /* SDK cargado */
+  const [gdriveConnected, setGdriveConnected] = useState(false); /* token activo */
+  const [gdriveStatus, setGdriveStatus] = useState('idle'); /* idle | syncing | synced | error */
+  const [gdriveLastSync, setGdriveLastSync] = useState(() => localStorage.getItem('gdrive_last_sync') || null);
+  const [gdriveError, setGdriveError] = useState(null);
+  const [gdriveAutoSync, setGdriveAutoSync] = useState(() => localStorage.getItem('gdrive_autosync') === 'true');
+  const syncTimerRef = useRef(null);
+
+  /* Esperar a que el SDK de Google cargue */
+  useEffect(() => {
+    let attempts = 0;
+    const checkSDK = setInterval(() => {
+      attempts++;
+      if (window.google?.accounts?.oauth2) {
+        const ok = gdrive.initTokenClient((token, err) => {
+          if (err) {
+            setGdriveError('Error de autorización: ' + err);
+            setGdriveConnected(false);
+            setGdriveStatus('error');
+            return;
+          }
+          setGdriveConnected(true);
+          setGdriveError(null);
+          /* Tras conectar, hacer pull inicial */
+          gdrivePull();
+        });
+        if (ok) { setGdriveReady(true); clearInterval(checkSDK); }
+      }
+      if (attempts > 40) clearInterval(checkSDK); /* timeout ~20s */
+    }, 500);
+    return () => clearInterval(checkSDK);
+  // eslint-disable-next-line
+  }, []);
+
+  /* Conectar a Drive (dispara popup OAuth) */
+  const gdriveConnect = () => {
+    setGdriveError(null);
+    setGdriveStatus('syncing');
+    gdrive.requestAuth(true);
+  };
+
+  /* Desconectar */
+  const gdriveDisconnect = () => {
+    gdrive.signOut();
+    setGdriveConnected(false);
+    setGdriveStatus('idle');
+    localStorage.setItem('gdrive_autosync', 'false');
+    setGdriveAutoSync(false);
+  };
+
+  /* PUSH: subir datos locales a Drive */
+  const gdrivePush = async () => {
+    if (!gdrive.accessToken) { setGdriveError('No conectado a Drive'); return; }
+    setGdriveStatus('syncing');
+    try {
+      const payload = {
+        appVersion: APP_VERSION,
+        savedAt: new Date().toISOString(),
+        data,
+        snapshots: loadSnapshots(),
+        fundamentals: loadFundamentals()
+      };
+      await gdrive.writeFile(payload);
+      const ts = new Date().toISOString();
+      localStorage.setItem('gdrive_last_sync', ts);
+      setGdriveLastSync(ts);
+      setGdriveStatus('synced');
+      setGdriveError(null);
+    } catch (e) {
+      setGdriveStatus('error');
+      setGdriveError(e.message);
+    }
+  };
+
+  /* PULL: descargar datos de Drive y aplicarlos */
+  const gdrivePull = async () => {
+    if (!gdrive.accessToken) return;
+    setGdriveStatus('syncing');
+    try {
+      const remote = await gdrive.readFile();
+      if (!remote || !remote.data) {
+        /* No hay archivo en Drive aún: subimos el local como primer estado */
+        await gdrivePush();
+        return;
+      }
+      /* Resolución de conflicto: comparar timestamps */
+      const remoteTime = new Date(remote.savedAt || 0).getTime();
+      const localSyncTime = localStorage.getItem('gdrive_last_sync')
+        ? new Date(localStorage.getItem('gdrive_last_sync')).getTime() : 0;
+
+      const applyRemote = () => {
+        if (remote.data) { setData(remote.data); persistData(remote.data); }
+        if (remote.snapshots) { persistSnapshots(remote.snapshots); setSnapshots(remote.snapshots); }
+        if (remote.fundamentals) { persistFundamentals(remote.fundamentals); setFundamentals(remote.fundamentals); }
+        const ts = new Date().toISOString();
+        localStorage.setItem('gdrive_last_sync', ts);
+        setGdriveLastSync(ts);
+        setGdriveStatus('synced');
+      };
+
+      if (remoteTime > localSyncTime) {
+        /* Drive tiene datos más nuevos */
+        const localHoldings = data.holdings?.length || 0;
+        const remoteHoldings = remote.data.holdings?.length || 0;
+        if (localHoldings > 0 && localHoldings !== remoteHoldings) {
+          /* Posible conflicto: preguntar */
+          if (confirm(`Google Drive tiene una versión más reciente (${remoteHoldings} posiciones) que la local (${localHoldings} posiciones).\n\n¿Cargar la versión de Drive? (Cancelar = mantener la local y subirla)`)) {
+            applyRemote();
+          } else {
+            await gdrivePush();
+          }
+        } else {
+          applyRemote();
+        }
+      } else {
+        /* Local es igual o más nuevo: subir local */
+        await gdrivePush();
+      }
+    } catch (e) {
+      setGdriveStatus('error');
+      setGdriveError(e.message);
+    }
+  };
+
+  /* Auto-sync: si está activo, push 3s después de cada cambio en data */
+  useEffect(() => {
+    if (!gdriveAutoSync || !gdriveConnected) return;
+    if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
+    syncTimerRef.current = setTimeout(() => { gdrivePush(); }, 3000);
+    return () => { if (syncTimerRef.current) clearTimeout(syncTimerRef.current); };
+  // eslint-disable-next-line
+  }, [data, snapshots, fundamentals, gdriveAutoSync, gdriveConnected]);
+
+  const toggleAutoSync = () => {
+    setGdriveAutoSync(v => {
+      const next = !v;
+      localStorage.setItem('gdrive_autosync', String(next));
+      return next;
+    });
+  };
+
 
   const toggleHidden = () => {
     setHidden(h => {
@@ -2664,6 +2993,22 @@ const App = () => {
                 <i className={`fa-solid ${hidden ? 'fa-eye-slash' : 'fa-eye'}`}></i>
                 <span className="hidden sm:inline ml-1">{hidden ? 'Discreto' : 'Visible'}</span>
               </button>
+              {/* Indicador Google Drive */}
+              {gdriveConnected && (
+                <button
+                  onClick={() => gdrivePush()}
+                  title={gdriveLastSync ? `Último sync: ${new Date(gdriveLastSync).toLocaleString('es-ES')}` : 'Sincronizar ahora'}
+                  className={`px-3 py-1.5 rounded text-sm flex items-center gap-1.5 ${
+                    gdriveStatus === 'error' ? 'bg-red-800 hover:bg-red-700' :
+                    gdriveStatus === 'syncing' ? 'bg-blue-800' :
+                    'bg-green-800 hover:bg-green-700'
+                  }`}>
+                  <i className={`fa-brands fa-google-drive ${gdriveStatus === 'syncing' ? 'fa-fade' : ''}`}></i>
+                  <span className="hidden sm:inline">
+                    {gdriveStatus === 'syncing' ? 'Sync...' : gdriveStatus === 'error' ? 'Error' : 'Drive'}
+                  </span>
+                </button>
+              )}
               <button onClick={() => setShowSettings(s => !s)} className="bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded text-sm">
                 <i className="fa-solid fa-cog"></i>
                 <span className="hidden sm:inline ml-1">Config</span>
@@ -2686,7 +3031,67 @@ const App = () => {
 
         {showSettings && (
           <div className="bg-slate-900 border border-slate-700 rounded-xl p-4 mb-4 space-y-4 animate-fade-in">
+            {/* ===== GOOGLE DRIVE SYNC ===== */}
             <div>
+              <h3 className="font-bold text-blue-400 text-sm uppercase tracking-wider mb-2">
+                <i className="fa-brands fa-google-drive mr-1"></i>Sincronización Google Drive
+              </h3>
+              {!gdriveReady && (
+                <div className="text-xs text-slate-500 bg-slate-800/50 rounded p-2">
+                  <i className="fa-solid fa-spinner fa-spin mr-1"></i>Cargando SDK de Google...
+                </div>
+              )}
+              {gdriveReady && !gdriveConnected && (
+                <div className="space-y-2">
+                  <div className="text-xs text-slate-400">
+                    Conecta tu Google Drive para sincronizar automáticamente tus datos entre PC, móvil y tablet.
+                  </div>
+                  <button onClick={gdriveConnect} className="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded text-sm font-bold">
+                    <i className="fa-brands fa-google-drive mr-1"></i>Conectar Google Drive
+                  </button>
+                </div>
+              )}
+              {gdriveConnected && (
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2 text-sm">
+                    <span className="inline-flex items-center gap-1 text-green-400">
+                      <i className="fa-solid fa-circle-check"></i>Conectado
+                    </span>
+                    {gdriveLastSync && (
+                      <span className="text-xs text-slate-500">
+                        · Último sync: {new Date(gdriveLastSync).toLocaleString('es-ES')}
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <button onClick={gdrivePush} disabled={gdriveStatus === 'syncing'} className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 px-3 py-1.5 rounded text-sm">
+                      <i className={`fa-solid fa-cloud-arrow-up ${gdriveStatus === 'syncing' ? 'fa-fade' : ''} mr-1`}></i>Subir ahora
+                    </button>
+                    <button onClick={gdrivePull} disabled={gdriveStatus === 'syncing'} className="bg-cyan-700 hover:bg-cyan-600 disabled:opacity-50 px-3 py-1.5 rounded text-sm">
+                      <i className="fa-solid fa-cloud-arrow-down mr-1"></i>Descargar de Drive
+                    </button>
+                    <button onClick={gdriveDisconnect} className="bg-slate-700 hover:bg-slate-600 px-3 py-1.5 rounded text-sm">
+                      <i className="fa-solid fa-link-slash mr-1"></i>Desconectar
+                    </button>
+                  </div>
+                  <label className="flex items-center gap-2 cursor-pointer mt-1">
+                    <input type="checkbox" checked={gdriveAutoSync} onChange={toggleAutoSync} className="w-4 h-4" />
+                    <span className="text-sm">Sincronización automática (sube cambios 3s después de cada modificación)</span>
+                  </label>
+                </div>
+              )}
+              {gdriveError && (
+                <div className="text-xs bg-red-950/40 border border-red-800 text-red-300 rounded p-2 mt-2">
+                  <i className="fa-solid fa-triangle-exclamation mr-1"></i>{gdriveError}
+                </div>
+              )}
+              <div className="text-xs text-slate-500 mt-2">
+                <i className="fa-solid fa-circle-info mr-1 text-blue-400"></i>
+                La app guarda un único archivo <span className="font-mono">portfolio_cockpit_data.json</span> en tu Drive. Usa permiso restringido (drive.file): la app solo accede a ese archivo, no al resto de tu Drive.
+              </div>
+            </div>
+
+            <div className="border-t border-slate-800 pt-4">
               <h3 className="font-bold text-amber-400 text-sm uppercase tracking-wider mb-2"><i className="fa-solid fa-shield mr-1"></i>Backup & Restore</h3>
               <div className="flex flex-wrap gap-2">
                 <button onClick={() => downloadBackup(data)} className="bg-green-600 hover:bg-green-500 px-3 py-2 rounded text-sm"><i className="fa-solid fa-download mr-1"></i>Backup JSON (incl. snapshots)</button>
@@ -2717,6 +3122,45 @@ const App = () => {
                 <i className="fa-solid fa-circle-info mr-1 text-orange-400"></i>
                 Si ves símbolos duplicados (NVDA aparece 2 veces en vez de consolidado con lotes), pulsa este botón. Es idempotente — no afecta data correcta.
               </div>
+            </div>
+
+            <div className="border-t border-slate-800 pt-4">
+              <h3 className="font-bold text-slate-400 text-sm uppercase tracking-wider mb-2"><i className="fa-solid fa-money-bill-wave mr-1"></i>Posiciones legacy de efectivo</h3>
+              <div className="text-xs text-slate-500 mb-2">
+                A partir de v2.7, la app sigue solo inversiones (no efectivo disponible). Si tienes posiciones tipo "cash" de versiones anteriores, están ocultas por defecto. Activa este toggle si quieres verlas de nuevo.
+              </div>
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={localStorage.getItem('show_legacy_cash') === 'true'}
+                  onChange={e => {
+                    localStorage.setItem('show_legacy_cash', String(e.target.checked));
+                    /* Forzar re-render */
+                    setData({ ...data });
+                  }}
+                  className="w-4 h-4"
+                />
+                <span className="text-sm">Mostrar posiciones legacy de efectivo en la tabla</span>
+              </label>
+              {data.holdings.filter(h => isPseudoCashOrEmpty(h)).length > 0 && (
+                <>
+                  <div className="text-xs text-slate-500 mt-2">
+                    <i className="fa-solid fa-info-circle mr-1 text-amber-400"></i>
+                    Tienes <span className="font-bold text-amber-400">{data.holdings.filter(h => isPseudoCashOrEmpty(h)).length}</span> posición(es) ocultas (efectivo legacy o saldo cero). Siguen en el backup JSON.
+                  </div>
+                  <button onClick={() => {
+                    const toDelete = data.holdings.filter(h => isPseudoCashOrEmpty(h));
+                    if (!toDelete.length) return;
+                    const list = toDelete.map(h => h.symbol || '(sin símbolo)').join(', ');
+                    if (!confirm(`¿Eliminar PERMANENTEMENTE estas ${toDelete.length} posiciones?\n\n${list}\n\nEsta acción NO se puede deshacer (excepto restaurando un backup).`)) return;
+                    const next = { ...data, holdings: data.holdings.filter(h => !isPseudoCashOrEmpty(h)) };
+                    setData(next); persistData(next);
+                    alert(`${toDelete.length} posición(es) eliminada(s) permanentemente.`);
+                  }} className="mt-2 bg-red-700 hover:bg-red-600 px-3 py-1.5 rounded text-xs">
+                    <i className="fa-solid fa-trash mr-1"></i>Eliminar permanentemente las posiciones ocultas
+                  </button>
+                </>
+              )}
             </div>
 
             <div className="border-t border-slate-800 pt-4">
